@@ -9,7 +9,7 @@ mod tui;
 use core::sync::atomic::Ordering;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -93,12 +93,26 @@ impl Profile {
     /// Tier quantum multipliers (fixed-point, 1024 = 1.0x) — 4 tiers + padding
     fn tier_multiplier(&self) -> [u32; 8] {
         match self {
-            Profile::Esports | Profile::Legacy | Profile::Gaming | Profile::Default => [
-                768,  // T0 Critical: 0.75x
+            Profile::Esports => [
+                256,  // T0 Critical: 0.25x = 0.25ms — fastest core release
+                1024, // T1 Interactive: 1.0x = 1ms
+                2048, // T2 Frame: 2.0x = 2ms
+                4095, // T3 Bulk: ~4x = 4ms
+                4095, 4095, 4095, 4095,
+            ],
+            Profile::Gaming | Profile::Default => [
+                512,  // T0 Critical: 0.5x = 1ms — releases cores to game threads quickly
+                1024, // T1 Interactive: 1.0x = 2ms
+                2048, // T2 Frame: 2.0x = 4ms
+                4095, // T3 Bulk: ~4x = 8ms
+                4095, 4095, 4095, 4095,
+            ],
+            Profile::Legacy => [
+                768,  // T0 Critical: 0.75x — older HW tolerates longer quanta
                 1024, // T1 Interactive: 1.0x
-                1229, // T2 Frame: 1.2x
-                1434, // T3 Bulk: 1.4x
-                1434, 1434, 1434, 1434, // Padding
+                1536, // T2 Frame: 1.5x
+                2048, // T3 Bulk: 2.0x — conservative for low-power CPUs
+                2048, 2048, 2048, 2048,
             ],
         }
     }
@@ -131,15 +145,38 @@ impl Profile {
     }
 
     /// Consolidated tier config - packs quantum/multiplier/budget/starvation into 64-bit per tier.
-    fn tier_configs(&self, quantum_us: u64) -> [u64; 8] {
-        let starvation = self.starvation_threshold();
+    ///
+    /// FIX (#4): `starvation_override` is the CLI `--starvation` value (microseconds).
+    /// When provided, all per-tier starvation thresholds are scaled proportionally
+    /// relative to the profile's T3 Bulk baseline so the ratio between tiers is preserved.
+    fn tier_configs(&self, quantum_us: u64, starvation_override: Option<u64>) -> [u64; 8] {
+        let base_starvation = self.starvation_threshold(); // nanoseconds
         let multiplier = self.tier_multiplier();
         let budget = self.wait_budget();
 
+        // Scale per-tier starvation if CLI --starvation overrides the profile default.
+        // All tiers scale proportionally: override_ns / default_T3_ns × tier_ns.
+        let starvation: [u64; 8] = if let Some(cli_us) = starvation_override {
+            let cli_ns = cli_us * 1000;
+            let default_t3 = base_starvation[3];
+            if default_t3 > 0 {
+                base_starvation.map(|s| s * cli_ns / default_t3)
+            } else {
+                base_starvation
+            }
+        } else {
+            base_starvation
+        };
+
         let mut configs = [0u64; 8];
         for i in 0..8 {
+            // FIX (audit): intf.h PACK_CONFIG takes q_kns in 1024-nanosecond slots
+            // (quantum_ns >> 10), NOT microseconds. Storing quantum_us here caused
+            // UNPACK_QUANTUM_NS to return quantum_us * 1024 ≈ 2.048ms for a 2000µs
+            // quantum instead of the correct 2.000ms (off by ~2.4%).
+            let quantum_kns = (quantum_us * 1000) >> 10;
             configs[i] = (multiplier[i] as u64 & 0xFFF)
-                | ((quantum_us & 0xFFFF) << 12)
+                | ((quantum_kns & 0xFFFF) << 12)
                 | (((budget[i] >> 10) & 0xFFFF) << 28)
                 | (((starvation[i] >> 10) & 0xFFFFF) << 44);
         }
@@ -217,6 +254,7 @@ struct Args {
     ///
     /// Safety limit: tasks running longer than this are forcibly preempted.
     /// Prevents any single task from monopolizing the CPU.
+    /// All per-tier starvation thresholds scale proportionally from this value.
     ///
     /// Esports: 50000µs (50ms) | Gaming: 100000µs (100ms) | Legacy: 200000µs (200ms)
     /// Recommended range: 50000-200000µs
@@ -257,7 +295,7 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     args: Args,
     topology: topology::TopologyInfo,
-    latency_matrix: Vec<Vec<f64>>,
+    latency_matrix: Arc<Mutex<Vec<Vec<f64>>>>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -281,25 +319,56 @@ impl<'a> Scheduler<'a> {
         let topo = topology::detect()?;
 
         // Get effective values (profile + CLI overrides)
-        let (quantum, new_flow_bonus, _starvation) = args.effective_values();
+        let (quantum, new_flow_bonus, _) = args.effective_values();
 
-        // ETD: Empirical Topology Discovery — display-grade measurement
-        // Measures inter-core CAS latency for startup heatmap and TUI display
-        info!("Starting ETD calibration...");
-        let latency_matrix = calibrate::calibrate_full_matrix(
-            topo.nr_cpus,
-            &calibrate::EtdConfig::default(),
-            |current, total, is_complete| {
-                tui::render_calibration_progress(current, total, is_complete);
-            },
-        );
+        // ETD: Empirical Topology Discovery — run in background so the scheduler
+        // loads immediately. Data is only used for the TUI heatmap; the scheduler
+        // operates correctly without it. The TUI will show "Calibrating..." until
+        // the background thread signals completion by populating the matrix.
+        info!("Starting ETD calibration in background...");
+        let nr_cpus_cal = topo.nr_cpus;
+        let latency_matrix = Arc::new(Mutex::new(
+            vec![vec![0.0f64; nr_cpus_cal]; nr_cpus_cal],
+        ));
+        let matrix_bg = latency_matrix.clone();
+
+        // FIX (#7): Suppress ETD stdout output when TUI/verbose mode is active.
+        // The TUI uses crossterm raw mode + alternate screen; concurrent stdout
+        // writes from the ETD thread corrupt the display. In verbose mode, the
+        // calibration is silent — progress is visible indirectly when the heatmap
+        // populates in the startup screen.
+        let is_verbose = args.verbose;
+
+        std::thread::spawn(move || {
+            let result = calibrate::calibrate_full_matrix(
+                nr_cpus_cal,
+                &calibrate::EtdConfig::default(),
+                |current, total, is_complete| {
+                    if !is_verbose {
+                        tui::render_calibration_progress(current, total, is_complete);
+                    }
+                },
+            );
+            // FIX (#5): Handle poisoned mutex gracefully instead of panicking.
+            // A panic in the ETD thread poisons the mutex — recover the inner
+            // value rather than crashing the scheduler process.
+            match matrix_bg.lock() {
+                Ok(mut m) => *m = result,
+                Err(e) => *e.into_inner() = result,
+            }
+        });
 
         // Configure the scheduler via rodata (read-only data)
         if let Some(rodata) = &mut open_skel.maps.rodata_data {
             rodata.quantum_ns = quantum * 1000;
             rodata.new_flow_bonus_ns = new_flow_bonus * 1000;
             rodata.enable_stats = args.verbose;
-            rodata.tier_configs = args.profile.tier_configs(quantum);
+
+            // FIX (#4): Pass CLI --starvation override so per-tier thresholds are
+            // actually applied to BPF rodata. Previously _starvation was computed
+            // and then discarded; now tier_configs() scales all tier thresholds
+            // proportionally when the CLI arg is present.
+            rodata.tier_configs = args.profile.tier_configs(quantum, args.starvation);
 
             // Topology: only has_hybrid is live (DVFS scaling in cake_tick)
             rodata.has_hybrid = topo.has_hybrid_cores;
@@ -344,7 +413,10 @@ impl<'a> Scheduler<'a> {
                 self.topology.clone(),
             )?;
         } else {
-            // Event-based silent mode - block on signalfd, poll with 60s timeout for UEI check
+            // FIX (#1): signalfd is the sole signal handler. The ctrlc crate
+            // previously installed a competing sigaction handler that raced with
+            // this signalfd, causing one mechanism to silently eat signals meant
+            // for the other. Using only signalfd here is correct.
 
             // Block SIGINT and SIGTERM from normal delivery
             let mut mask = SigSet::empty();
@@ -414,9 +486,24 @@ impl<'a> Scheduler<'a> {
         let (q, _nfb, starv) = self.args.effective_values();
         let profile_str = format!("{:?}", self.args.profile).to_uppercase();
 
+        // FIX (#5): Recover from a poisoned mutex rather than panicking.
+        // If the ETD thread panicked, the mutex is poisoned — extract the inner
+        // value (which may be a partial matrix) rather than crashing.
+        //
+        // FIX (audit): Clone the matrix immediately to release the MutexGuard
+        // before entering render_startup_screen's 4,200ms animation loop.
+        // Previously the guard was held for the full animation duration, blocking
+        // the ETD background thread from writing its result — the startup heatmap
+        // always showed "Calibrating..." even when ETD finished first.
+        let matrix = self
+            .latency_matrix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
         tui::render_startup_screen(tui::StartupParams {
             topology: &self.topology,
-            latency_matrix: &self.latency_matrix,
+            latency_matrix: &matrix,
             profile: &profile_str,
             quantum: q,
             starvation: starv,
@@ -429,14 +516,11 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Set up signal handler
+    // FIX (#1): Use only signalfd for signal handling (in run() below).
+    // The ctrlc::set_handler call was removed — it installed a competing sigaction
+    // handler for SIGINT/SIGTERM that raced with the signalfd in the event loop,
+    // causing one mechanism to silently eat signals meant for the other.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    ctrlc::set_handler(move || {
-        info!("Received shutdown signal");
-        shutdown_clone.store(true, Ordering::Relaxed);
-    })?;
 
     // Create open object for BPF - needs to outlive scheduler
     let mut open_object = std::mem::MaybeUninit::uninit();

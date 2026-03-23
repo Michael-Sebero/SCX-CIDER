@@ -190,11 +190,16 @@ typedef u64 fused_config_t;
 /* Starvation: bits 44-63. SHR; SHL. (Mask redundant) */
 #define UNPACK_STARVATION_NS(cfg) (((cfg) >> CFG_SHIFT_STARVATION) << 10)
 
-/* Packing Macro (Userspace/Helper) */
-#define PACK_CONFIG(q_us, mult, budget_us, starv_us) \
+/* FIX (#14): PACK_CONFIG unit clarification.
+ * Parameters q_kns, budget_kns, starv_kns are in 1024-nanosecond slots (kns),
+ * NOT microseconds — callers pass (value_in_ns >> 10). The "us" suffix in the
+ * original name was misleading; renamed to _kns to reflect the actual unit.
+ * Userspace callers: divide nanoseconds by 1024 before passing.
+ * BPF unpack macros (UNPACK_*_NS) shift left by 10 to recover nanoseconds. */
+#define PACK_CONFIG(q_kns, mult, budget_kns, starv_kns) \
     ((((u64)(mult) & CFG_MASK_MULTIPLIER) << CFG_SHIFT_MULTIPLIER) | \
-     (((u64)(q_us) & CFG_MASK_QUANTUM) << CFG_SHIFT_QUANTUM) | \
-     (((u64)(budget_us) & CFG_MASK_BUDGET) << CFG_SHIFT_BUDGET) | \
-     (((u64)(starv_us) & CFG_MASK_STARVATION) << CFG_SHIFT_STARVATION))
+     (((u64)(q_kns) & CFG_MASK_QUANTUM) << CFG_SHIFT_QUANTUM) | \
+     (((u64)(budget_kns) & CFG_MASK_BUDGET) << CFG_SHIFT_BUDGET) | \
+     (((u64)(starv_kns) & CFG_MASK_STARVATION) << CFG_SHIFT_STARVATION))
 
 #endif /* __CAKE_INTF_H */

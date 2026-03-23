@@ -39,8 +39,11 @@ pub struct TopologyInfo {
     pub llc_cpu_mask: [u64; MAX_LLCS],
     pub big_cpu_mask: u64,
 
-    // Info
-    pub cpus_per_ccd: u32,
+    // FIX (#12): Field name and doc clarified — this counts logical CPUs (threads)
+    // per CCD, NOT physical cores. With SMT enabled on a 6-core CCD this will be
+    // 12, not 6. Renamed inner variable from `core_count` to `thread_count` at
+    // the computation site to prevent future confusion.
+    pub threads_per_ccd: u32,
 }
 
 pub fn detect() -> Result<TopologyInfo> {
@@ -84,7 +87,7 @@ pub fn detect() -> Result<TopologyInfo> {
         core_thread_mask: [0; 32],
         llc_cpu_mask: [0; MAX_LLCS],
         big_cpu_mask: 0,
-        cpus_per_ccd: 0,
+        threads_per_ccd: 0,
     };
 
     // 1. Map LLCs
@@ -98,21 +101,25 @@ pub fn detect() -> Result<TopologyInfo> {
         }
 
         let mut mask = 0u64;
-        let mut core_count = 0;
+        // FIX (#12): Renamed from `core_count` to `thread_count` — all_cpus iterates
+        // logical CPUs (hardware threads), not physical cores. With 2-way SMT the count
+        // will be 2× the physical core count. Callers needing core count should divide
+        // by the SMT degree (e.g., threads_per_ccd / 2 for dual-SMT).
+        let mut thread_count = 0u32;
 
         for cpu_id in llc.all_cpus.keys() {
             let cpu = *cpu_id;
             if cpu < MAX_CPUS {
                 info.cpu_llc_id[cpu] = llc_idx as u8;
                 mask |= 1u64 << cpu;
-                core_count += 1;
+                thread_count += 1;
             }
         }
 
         info.llc_cpu_mask[llc_idx] = mask;
-        if info.cpus_per_ccd == 0 {
-            info.cpus_per_ccd = core_count;
-        } // Estimate
+        if info.threads_per_ccd == 0 {
+            info.threads_per_ccd = thread_count;
+        }
 
         llc_idx += 1;
     }

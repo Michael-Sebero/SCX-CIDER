@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use quanta::Clock;
 
 /// Cache-line padded atomic to avoid false sharing
@@ -58,6 +58,29 @@ impl Default for EtdConfig {
     }
 }
 
+// FIX (#13): Helper that sets RT priority and warns (rather than silently ignoring) on failure.
+// On non-root execution sched_setscheduler returns EPERM — measurements continue but
+// with potential scheduler jitter that may inflate latency values.
+fn try_set_realtime_priority() {
+    unsafe {
+        let param = libc::sched_param { sched_priority: 99 };
+        let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+        if ret != 0 {
+            warn!(
+                "ETD: Failed to set RT priority ({}). Run as root for accurate measurements.",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+fn reset_normal_priority() {
+    unsafe {
+        let param = libc::sched_param { sched_priority: 0 };
+        libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+    }
+}
+
 /// Measure round-trip latency between two CPUs using CAS ping-pong. Returns per-sample latencies (ns).
 fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f64>> {
     let state = Arc::new(SharedState {
@@ -82,11 +105,8 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
                 return;
             }
 
-            // Set real-time priority to minimize preemption jitter
-            unsafe {
-                let param = libc::sched_param { sched_priority: 99 };
-                libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
-            }
+            // FIX (#13): Warn on RT priority failure instead of silently ignoring
+            try_set_realtime_priority();
 
             state_pong.barrier.wait();
 
@@ -114,11 +134,7 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
                 }
             }
 
-            // Reset to normal priority before thread exit
-            unsafe {
-                let param = libc::sched_param { sched_priority: 0 };
-                libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
-            }
+            reset_normal_priority();
         });
 
         // PING thread: sets to PING, waits for PONG, measures time
@@ -128,11 +144,8 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
                 return None;
             }
 
-            // Set real-time priority to minimize preemption jitter
-            unsafe {
-                let param = libc::sched_param { sched_priority: 99 };
-                libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
-            }
+            // FIX (#13): Warn on RT priority failure instead of silently ignoring
+            try_set_realtime_priority();
 
             let mut results = Vec::with_capacity(num_samples);
 
@@ -171,11 +184,7 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
                 results.push(duration_ns / (num_round_trips as f64 * 2.0));
             }
 
-            // Reset to normal priority before thread exit
-            unsafe {
-                let param = libc::sched_param { sched_priority: 0 };
-                libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
-            }
+            reset_normal_priority();
 
             Some(results)
         });

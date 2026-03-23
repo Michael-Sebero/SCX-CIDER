@@ -386,6 +386,10 @@ fn render_startup_widgets(
     };
     let author_typed = &author_full[..chars_to_show];
 
+    // FIX (#16): Use Cargo package version rather than a hardcoded literal so the
+    // TUI always reflects the current release without a manual string update.
+    let version_str = concat!("v", env!("CARGO_PKG_VERSION"));
+
     let title = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(" 🍰 ", Style::default().fg(Color::Yellow)),
@@ -395,7 +399,7 @@ fn render_startup_widgets(
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("v1.02", Style::default().fg(Color::White)),
+            Span::styled(version_str, Style::default().fg(Color::White)),
             Span::styled(
                 " │ Gaming Oriented Scheduler",
                 Style::default()
@@ -494,7 +498,7 @@ fn render_startup_widgets(
     topology_grid.render(left_layout[2], buffer);
 
     // --- Empirical Fabric (The Heatmap) ---
-    let heatmap = LatencyHeatmap::new(params.latency_matrix, params.topology);
+    let heatmap = LatencyHeatmap::new(params.latency_matrix);
     heatmap.render(dashboard_layout[1], buffer);
 
     // --- Numerical Truth (Raw Data) ---
@@ -535,6 +539,7 @@ fn build_cpu_topology_grid_compact(topology: &TopologyInfo) -> Paragraph<'static
     lines.push(Line::from(""));
 
     let mut current_line = Vec::new();
+
     for cpu in 0..nr_cpus {
         // Dot indicator for core type
         let symbol = if topology.cpu_is_big.get(cpu).copied().unwrap_or(0) != 0 {
@@ -581,15 +586,34 @@ fn build_cpu_topology_grid_compact(topology: &TopologyInfo) -> Paragraph<'static
     )
 }
 
+// FIX (#8): Map a measured latency value to a heat color.
+// When calibration data is available (max_ns > 0), colors scale from
+// cool (low latency, near topology minimum) to hot (high latency).
+// Falls back to topology-based colors when the matrix is all zeros
+// (calibration not yet complete).
+fn latency_heat_color(latency_ns: f64, min_ns: f64, max_ns: f64) -> Color {
+    if max_ns <= 0.0 || (max_ns - min_ns) < 1.0 {
+        // No calibration data — neutral gray
+        return Color::Rgb(80, 80, 80);
+    }
+    // Clamp ratio to [0, 1]
+    let ratio = ((latency_ns - min_ns) / (max_ns - min_ns)).clamp(0.0, 1.0);
+
+    // Cool-to-hot gradient: teal → cyan → yellow → amber
+    let r = (ratio * 255.0) as u8;
+    let g = ((1.0 - ratio * 0.3) * 200.0) as u8;
+    let b = ((1.0 - ratio).powi(2) * 220.0) as u8;
+    Color::Rgb(r, g, b)
+}
+
 /// Custom Widget for high-density Latency Heatmap
 struct LatencyHeatmap<'a> {
     matrix: &'a [Vec<f64>],
-    topology: &'a TopologyInfo,
 }
 
 impl<'a> LatencyHeatmap<'a> {
-    fn new(matrix: &'a [Vec<f64>], topology: &'a TopologyInfo) -> Self {
-        Self { matrix, topology }
+    fn new(matrix: &'a [Vec<f64>]) -> Self {
+        Self { matrix }
     }
 }
 
@@ -610,21 +634,52 @@ impl<'a> Widget for LatencyHeatmap<'a> {
             return;
         }
 
-        // Header for Target CPUs (X-axis)
+        // FIX (#8): Compute global min/max of non-zero, non-diagonal latency values
+        // so the heat gradient spans the actual measured range rather than being
+        // a static topology diagram that ignores the ETD measurements entirely.
+        let mut min_ns = f64::MAX;
+        let mut max_ns = 0.0f64;
+        for i in 0..nr_cpus {
+            for j in 0..nr_cpus {
+                if i != j {
+                    let v = self.matrix[i][j];
+                    if v > 0.0 {
+                        min_ns = min_ns.min(v);
+                        max_ns = max_ns.max(v);
+                    }
+                }
+            }
+        }
+        // If no data yet (all zeros), min_ns stays MAX — latency_heat_color handles this
+        if min_ns == f64::MAX {
+            min_ns = 0.0;
+        }
+
+        // FIX (audit): Two-row header so CPUs ≥10 are unambiguous.
+        // Previously format!("{:1}", j % 10) made CPU 0 and CPU 10 display
+        // the same label "0", etc. Row 0 shows the tens digit (blank for <10),
+        // Row 1 shows the ones digit.
         for j in 0..nr_cpus {
             let x = inner_area.x + 6 + (j as u16 * 2);
             if x < inner_area.right() {
+                let tens = j / 10;
                 buf.set_string(
                     x,
                     inner_area.y,
-                    format!("{:1}", j % 10),
+                    if tens > 0 { format!("{}", tens) } else { " ".to_string() },
+                    Style::default().fg(Color::Cyan).dim(),
+                );
+                buf.set_string(
+                    x,
+                    inner_area.y + 1,
+                    format!("{}", j % 10),
                     Style::default().fg(Color::Cyan).dim(),
                 );
             }
         }
 
         for i in 0..nr_cpus {
-            let y = inner_area.y + 1 + i as u16;
+            let y = inner_area.y + 2 + i as u16;  // +2 for two-row header
             if y >= inner_area.bottom() {
                 break;
             }
@@ -644,17 +699,15 @@ impl<'a> Widget for LatencyHeatmap<'a> {
                 }
 
                 let is_self = i == j;
-                let is_smt = self.topology.cpu_sibling_map[i] as usize == j;
-                let same_ccd = self.topology.cpu_llc_id[i] == self.topology.cpu_llc_id[j];
-
                 let style = if is_self {
+                    // Diagonal — self-latency is meaningless, render dark
                     Style::default().fg(Color::Rgb(40, 40, 40))
-                } else if is_smt {
-                    Style::default().fg(Color::Rgb(0, 255, 150)) // Turquoise
-                } else if same_ccd {
-                    Style::default().fg(Color::Rgb(0, 200, 255)) // Cyan
                 } else {
-                    Style::default().fg(Color::Rgb(255, 180, 0)) // Amber
+                    // FIX (#8): Color driven by measured latency value, not topology category.
+                    // When calibration hasn't run yet (matrix all zeros) the gradient falls
+                    // back to a uniform gray via latency_heat_color's max_ns==0 guard.
+                    let cell_color = latency_heat_color(self.matrix[i][j], min_ns, max_ns);
+                    Style::default().fg(cell_color)
                 };
 
                 buf.set_string(x, y, "█", style);
@@ -662,28 +715,31 @@ impl<'a> Widget for LatencyHeatmap<'a> {
             }
         }
 
-        // Legend at bottom
+        // Legend at bottom showing latency range
         let legend_y = inner_area.bottom().saturating_sub(1);
         let legend_x = inner_area.x + 1;
-        if legend_y > inner_area.y + nr_cpus as u16 {
-            buf.set_string(
-                legend_x,
-                legend_y,
-                "█ SMT",
-                Style::default().fg(Color::Rgb(0, 255, 150)),
-            );
-            buf.set_string(
-                legend_x + 9,
-                legend_y,
-                "█ Same CCD",
-                Style::default().fg(Color::Rgb(0, 200, 255)),
-            );
-            buf.set_string(
-                legend_x + 22,
-                legend_y,
-                "█ Cross-CCD",
-                Style::default().fg(Color::Rgb(255, 180, 0)),
-            );
+        if legend_y > inner_area.y + nr_cpus as u16 + 1 {  // +1 for two-row header
+            if max_ns > 0.0 {
+                buf.set_string(
+                    legend_x,
+                    legend_y,
+                    format!("min:{:.0}ns", min_ns),
+                    Style::default().fg(Color::Rgb(0, 200, 200)),
+                );
+                buf.set_string(
+                    legend_x + 14,
+                    legend_y,
+                    format!("max:{:.0}ns", max_ns),
+                    Style::default().fg(Color::Rgb(255, 180, 0)),
+                );
+            } else {
+                buf.set_string(
+                    legend_x,
+                    legend_y,
+                    "Calibrating...",
+                    Style::default().fg(Color::DarkGray),
+                );
+            }
         }
     }
 }
@@ -961,6 +1017,19 @@ pub fn run_tui(
     interval_secs: u64,
     topology: TopologyInfo,
 ) -> Result<()> {
+    // FIX (#6): Install a panic hook that restores the terminal before printing
+    // the panic message. Without this, any widget rendering panic leaves the
+    // terminal in raw mode with the cursor hidden — the user's shell becomes
+    // unusable until they run `reset`.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort — ignore errors; the panic message is more important
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        let _ = io::stdout().execute(Show);
+        original_hook(info);
+    }));
+
     let mut terminal = setup_terminal()?;
     let mut app = TuiApp::new(topology);
     let tick_rate = Duration::from_secs(interval_secs);

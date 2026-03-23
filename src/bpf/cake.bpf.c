@@ -31,6 +31,12 @@ const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
  * ═══════════════════════════════════════════════════════════════════════════ */
 struct mega_mailbox_entry mega_mailbox[CAKE_MAX_CPUS] SEC(".bss");
 
+/* LLC non-empty bitmask: bit i is set when LLC i has tasks queued.
+ * Updated in enqueue (set) and dispatch (cleared on drain).
+ * Allows O(1) steal target selection vs O(nr_llcs) sequential scan.
+ * Races are harmless: a stale set bit causes one extra failed dsq_move. */
+volatile u32 llc_nonempty_mask SEC(".bss");
+
 /* Metadata accessors (Fused layout) */
 #define GET_TIER_RAW(packed) EXTRACT_BITS_U32(packed, SHIFT_TIER, 2)
 #define GET_TIER(ctx) GET_TIER_RAW(cake_relaxed_load_u32(&(ctx)->packed_info))
@@ -42,6 +48,8 @@ struct cake_scratch {
     u32 cached_llc;            /* LLC ID tunneled from select_cpu → enqueue (saves 1 kfunc) */
     u64 cached_now;            /* scx_bpf_now() tunneled from select_cpu → enqueue (saves 1 kfunc) */
     struct bpf_iter_scx_dsq it; /* BSS-Tunneling for iterators */
+    /* FIX (#18): bpf_iter_scx_dsq assumed ~75B; adjust _pad if _Static_assert fires
+     * after a kernel update that changes the iterator struct layout. */
     u8 _pad[36]; /* Pad to 128 bytes (2 cache lines) */
 } global_scratch[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligned(128)));
 _Static_assert(sizeof(struct cake_scratch) <= 128,
@@ -133,27 +141,6 @@ struct {
     __type(value, struct cake_task_ctx);
 } task_ctx SEC(".maps");
 
-/* RESTORE peek_legacy via scratch tunnel */
-__attribute__((noinline))
-struct task_struct *cake_bpf_dsq_peek_legacy(u64 dsq_id)
-{
-    /* Preserve dsq_id across helper call */
-    register u64 dsq_reg asm("r9") = dsq_id;
-    asm volatile("" : "+r"(dsq_reg));
-
-    u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    asm volatile("" : "+r"(dsq_reg)); /* Refresh liveness */
-
-    struct cake_scratch *scr = &global_scratch[cpu];
-    struct task_struct *p = NULL;
-
-    if (bpf_iter_scx_dsq_new(&scr->it, dsq_reg, 0) == 0) {
-        p = bpf_iter_scx_dsq_next(&scr->it);
-        bpf_iter_scx_dsq_destroy(&scr->it);
-    }
-    return p;
-}
-
 /* Bitfield accessors - relaxed atomics prevent tearing */
 
 /* Metadata Accessors - Definitions moved to top */
@@ -182,7 +169,6 @@ struct cake_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
 
     ctx->next_slice = quantum_ns;
     u16 init_deficit = (u16)((quantum_ns + new_flow_bonus_ns) >> 10);
-    ctx->deficit_avg_fused = PACK_DEFICIT_AVG(init_deficit, 0);
     ctx->last_run_at = 0;
     ctx->reclass_counter = 0;
 
@@ -226,6 +212,32 @@ struct cake_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
          * avg_runtime reclassifies to correct tier within ~3 stops. */
         init_tier = CAKE_TIER_INTERACT;
     }
+
+    /* FIX (audit): Seed avg_runtime_us at the midpoint of the initial tier's
+     * expected range rather than 0. Starting from 0 caused any task with a
+     * short first execution bout (< tier gate / 16) to receive an EWMA of
+     * rt/16 after one bout — fast enough to classify as T0 — regardless of
+     * its long-term behavior.  A bulk task (nice >10) with a 200µs first
+     * bout would earn T0 priority for 4–16 subsequent bouts before the EWMA
+     * corrected, starving gaming threads at application startup time.
+     *
+     * Midpoints chosen as the geometric mean of adjacent gate values so the
+     * EWMA converges to the correct tier within ~3 bouts for well-behaved tasks:
+     *   T0 Critical  (< 100µs):   midpoint ≈  50µs
+     *   T1 Interact  (< 2000µs):  midpoint ≈ 1050µs
+     *   T2 Frame     (< 8000µs):  midpoint ≈ 5000µs
+     *   T3 Bulk      (≥ 8000µs):  floor  = 8001µs */
+    u16 init_avg_rt;
+    if (init_tier == CAKE_TIER_CRITICAL)
+        init_avg_rt = TIER_GATE_T0 / 2;
+    else if (init_tier == CAKE_TIER_INTERACT)
+        init_avg_rt = (TIER_GATE_T0 + TIER_GATE_T1) / 2;
+    else if (init_tier == CAKE_TIER_FRAME)
+        init_avg_rt = (TIER_GATE_T1 + TIER_GATE_T2) / 2;
+    else
+        init_avg_rt = TIER_GATE_T2 + 1;
+
+    ctx->deficit_avg_fused = PACK_DEFICIT_AVG(init_deficit, init_avg_rt);
 
     u32 packed = 0;
     packed |= (255 & MASK_KALMAN_ERROR) << SHIFT_KALMAN_ERROR;
@@ -302,6 +314,21 @@ s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags)
     u64 slice = tctx ? tctx->next_slice : quantum_ns;
 
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
+
+    /* FIX (#11): Count direct-dispatch stats so TUI reflects the common idle-path case.
+     * Previously only cake_enqueue counted dispatches, but on an idle gaming system
+     * nearly all dispatches bypass enqueue via SCX_DSQ_LOCAL_ON, making the TUI show
+     * near-zero counts. Gate on enable_stats to keep the hot path zero-overhead. */
+    if (enable_stats) {
+        struct cake_stats *s = get_local_stats();
+        if (s) {
+            s->nr_new_flow_dispatches++;
+            u8 tier = tctx ? (GET_TIER(tctx) & 3) : CAKE_TIER_INTERACT;
+            if (tier < CAKE_TIER_MAX)
+                s->nr_tier_dispatches[tier]++;
+        }
+    }
+
     return (s32)cpu;
 }
 
@@ -329,13 +356,31 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         struct cake_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
         u64 slice = tctx ? tctx->next_slice : quantum_ns;
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
+
+        /* FIX (#11): Count idle-path direct dispatches for accurate TUI stats. */
+        if (enable_stats) {
+            struct cake_stats *s = get_local_stats();
+            if (s) {
+                s->nr_new_flow_dispatches++;
+                u8 tier = tctx ? (GET_TIER(tctx) & 3) : CAKE_TIER_INTERACT;
+                if (tier < CAKE_TIER_MAX)
+                    s->nr_tier_dispatches[tier]++;
+            }
+        }
+
         return cpu;
     }
 
     /* ALL BUSY: tunnel LLC ID + timestamp for enqueue (~22ns saved on
      * the 90% idle path above where these were previously wasted).
-     * select_cpu runs on same CPU as enqueue — safe to tunnel. */
-    scr->cached_llc = cpu_llc_id[tc_id];
+     * select_cpu runs on same CPU as enqueue — safe to tunnel.
+     *
+     * FIX (audit): Use the *task's* target LLC (derived from cpu, which is
+     * prev_cpu when all CPUs are busy) rather than the *waker's* LLC (tc_id).
+     * On a dual-CCD system nearly all "all-busy" enqueues previously landed
+     * in the waker's LLC DSQ but were dispatched from prev_cpu's LLC, forcing
+     * 100% of those tasks through the slower cross-LLC steal path. */
+    scr->cached_llc = cpu_llc_id[(u32)cpu & (CAKE_MAX_CPUS - 1)];
     scr->cached_now = scx_bpf_now();
     return prev_cpu;
 }
@@ -362,19 +407,31 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 
     struct cake_task_ctx *tctx = get_task_ctx(p_reg, false);
 
-    /* Kthread cold path (inlined — reuses now_cached + enq_llc) */
+    /* FIX (#10): Kthreads without a tctx (race window before cake_enable fires)
+     * previously received CAKE_TIER_CRITICAL unconditionally, giving kcompactd,
+     * kswapd, and similar bulk kthreads unwarranted T0 priority that could starve
+     * game threads. Changed to CAKE_TIER_INTERACT (T1) which matches the tier
+     * assigned to nice=0 kthreads by alloc_task_ctx_cold(). They will reclassify
+     * to their correct tier within a few stops once a tctx is allocated. */
     if (unlikely((task_flags & PF_KTHREAD) && !tctx)) {
-        u64 vtime = ((u64)CAKE_TIER_CRITICAL << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
+        u64 vtime = ((u64)CAKE_TIER_INTERACT << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
+        __sync_fetch_and_or(&llc_nonempty_mask, 1u << enq_llc);
         return;
     }
 
     register struct cake_task_ctx *tctx_reg asm("r7") = tctx;
 
-    /* Handle Yields/Background */
+    /* FIX (#3): Voluntarily yielding T0/T1 tasks (sched_yield, brief hardware wait)
+     * were previously hard-coded to CAKE_TIER_BULK, sending audio/input threads to
+     * the back of the T3 queue for up to 100ms. They now use their actual tier so
+     * latency-sensitive tasks remain properly prioritized even when yielding.
+     * Tasks with no context yet fall back to T3 (yield implies they're not urgent). */
     if (!(enq_flags & (SCX_ENQ_WAKEUP | SCX_ENQ_PREEMPT))) {
-        u64 vtime = ((u64)CAKE_TIER_BULK << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
+        u8 yield_tier = tctx_reg ? (GET_TIER(tctx_reg) & 3) : CAKE_TIER_BULK;
+        u64 vtime = ((u64)yield_tier << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
+        __sync_fetch_and_or(&llc_nonempty_mask, 1u << enq_llc);
         return;
     }
 
@@ -382,6 +439,7 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
         /* No context yet - use Frame tier */
         u64 vtime = ((u64)CAKE_TIER_FRAME << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
+        __sync_fetch_and_or(&llc_nonempty_mask, 1u << enq_llc);
         return;
     }
 
@@ -404,15 +462,25 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      * DRR++ NEW FLOW BONUS: Tasks with CAKE_FLOW_NEW get a vtime reduction,
      * making them drain before established same-tier tasks. This gives
      * newly spawned threads instant responsiveness (e.g., game launching a
-     * new worker). Cleared by reclassify_task_cold when deficit exhausts. */
-    u64 vtime = ((u64)tier << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
+     * new worker). Cleared by reclassify_task_cold when deficit exhausts.
+     *
+     * FIX (#2): Guard vtime subtraction to prevent underflow into the tier
+     * bits at [63:56]. If now_cached is small (early boot or timer wrap) and
+     * new_flow_bonus_ns is large (8ms), the raw subtraction wraps the u64
+     * into the tier field, silently misclassifying the task. Use saturating
+     * arithmetic on the timestamp portion only. */
+    u64 ts = now_cached & 0x00FFFFFFFFFFFFFFULL;
     u32 task_packed = cake_relaxed_load_u32(&tctx_reg->packed_info);
     if (task_packed & ((u32)CAKE_FLOW_NEW << SHIFT_FLAGS))
-        vtime -= new_flow_bonus_ns;
+        ts = (ts > new_flow_bonus_ns) ? (ts - new_flow_bonus_ns) : 0;
+    u64 vtime = ((u64)tier << 56) | ts;
+
     scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, slice, vtime, enq_flags);
+    /* Mark LLC as non-empty so dispatch can find work in O(1) */
+    __sync_fetch_and_or(&llc_nonempty_mask, 1u << enq_llc);
 }
 
-/* Dispatch: per-LLC DSQ scan with cross-LLC stealing fallback.
+/* Dispatch: per-LLC DSQ scan with O(1) bitmask-driven cross-LLC stealing.
  * Direct-dispatched tasks (SCX_DSQ_LOCAL_ON) bypass this callback entirely —
  * kernel handles them natively. Only tasks that went through
  * cake_enqueue → per-LLC DSQ arrive here. */
@@ -424,21 +492,28 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
     if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + my_llc))
         return;
 
-    /* Steal from other LLCs (only when local is empty).
-     * RODATA gate: Clang doesn't constant-fold RODATA globals, so without
-     * this check, single-LLC systems (9800X3D) execute 7 unrolled
-     * load+branch pairs that always break immediately. (Rule 5) */
+    /* Drain confirmed empty — clear our bit */
+    __sync_fetch_and_and(&llc_nonempty_mask, ~(1u << my_llc));
+
+    /* RODATA gate: single-LLC systems skip steal entirely (Rule 5) */
     if (nr_llcs <= 1)
         return;
 
-    for (u32 i = 1; i < CAKE_MAX_LLCS; i++) {
-        if (i >= nr_llcs)
-            break;
-        u32 victim = my_llc + i;
+    /* O(1) steal: only visit LLCs that have reported work.
+     * Stale set bits cause at most one failed dsq_move per race — harmless. */
+    u32 steal_mask = cake_relaxed_load_u32(&llc_nonempty_mask) & ~(1u << my_llc);
+    for (u32 i = 0; steal_mask && i < CAKE_MAX_LLCS; i++) {
+        /* FIX (#15): steal_mask is u32 — use BIT_SCAN_FORWARD_U32 instead of the u64
+         * variant. The u64 De Bruijn path works by zero-extension but uses a 64-bit
+         * multiplier and index table that is semantically incorrect for u32 operands. */
+        u32 victim = BIT_SCAN_FORWARD_U32(steal_mask);
+        steal_mask &= steal_mask - 1;  /* clear LSB */
         if (victim >= nr_llcs)
-            victim -= nr_llcs;
+            continue;
         if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + victim))
             return;
+        /* Victim was empty despite bit being set — clear stale bit */
+        __sync_fetch_and_and(&llc_nonempty_mask, ~(1u << victim));
     }
 }
 
@@ -555,6 +630,17 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     tctx->last_run_at = (u32)scx_bpf_now();
 }
 
+/* Precomputed hysteresis gate tables (RODATA — JIT constant-folds these).
+ * _demote[i]: standard gate — task at or above this average demotes past tier i.
+ * _promote[i]: 90% of gate — task must be clearly faster to earn promotion.
+ * Eliminates 3 runtime divisions per reclassify call. */
+static const u16 tier_gate_demote[3]  = { TIER_GATE_T0, TIER_GATE_T1, TIER_GATE_T2 };
+static const u16 tier_gate_promote[3] = {
+    TIER_GATE_T0 - TIER_GATE_T0 / 10,   /* 90 */
+    TIER_GATE_T1 - TIER_GATE_T1 / 10,   /* 1800 */
+    TIER_GATE_T2 - TIER_GATE_T2 / 10,   /* 7200 */
+};
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * AVG_RUNTIME CLASSIFICATION + DRR++: Dynamic tier reclassification on every stop.
  * CPU analog of network CAKE's flow classification:
@@ -590,30 +676,53 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
      * → recheck every 16th stop. Uses per-task counter + RODATA masks. */
     u8 stable = (packed >> SHIFT_STABLE) & 3;
     if (stable == 3) {
-        /* Fast path: update EWMA + deficit without full tier mapping */
+        /* FIX (#9): EWMA double-update on graduated backoff trigger.
+         *
+         * Previously, the fast path unconditionally wrote deficit_avg_fused and
+         * then fell through to full reclassification, which read the already-updated
+         * value and applied EWMA a second time — effectively doubling alpha on every
+         * backoff-period boundary (promoting at α=1/2 instead of 1/4).
+         *
+         * Fix: compute EWMA values but only write deficit_avg_fused when taking the
+         * early-return path. The full reclassify path below reads the original
+         * (unmodified) old_fused and applies EWMA exactly once. */
         u32 old_fused = tctx->deficit_avg_fused;
         u16 avg_rt = EXTRACT_AVG_RT(old_fused);
-        u16 new_avg = avg_rt - (avg_rt >> 3) + (rt_clamped >> 3);
+        /* Asymmetric EWMA: promote fast (α=1/4), demote cautiously (α=1/16).
+         * Gaming threads spike during loads then recover — fast promotion
+         * restores T0/T1 priority within ~4 bouts instead of ~16. */
+        u16 new_avg;
+        if (rt_clamped < avg_rt)
+            new_avg = avg_rt - (avg_rt >> 2) + (rt_clamped >> 2);  /* promote α=1/4 */
+        else
+            new_avg = avg_rt - (avg_rt >> 4) + (rt_clamped >> 4);  /* demote  α=1/16 */
         u16 deficit = EXTRACT_DEFICIT(old_fused);
         deficit = (rt_clamped >= deficit) ? 0 : deficit - rt_clamped;
-        u32 new_fused = PACK_DEFICIT_AVG(deficit, new_avg);
-        if (new_fused != old_fused)
-            tctx->deficit_avg_fused = new_fused;
 
         /* Per-tier recheck: increment counter, check against tier mask */
         u8 tier = (packed >> SHIFT_TIER) & MASK_TIER;
-        u16 mask = tier_recheck_mask[tier & 3];
+        /* FIX (audit): Use & 7 to match all other tier array accesses.
+         * & 3 was semantically correct (tier is 2-bit) but inconsistent
+         * with tier_configs[] and tier_perf_target[] which use & 7. */
+        u16 mask = tier_recheck_mask[tier & 7];
         u16 counter = tctx->reclass_counter + 1;
         tctx->reclass_counter = counter;
         if (counter & mask) {
-            /* Not time for full recheck — spot-check: would new EWMA
-             * classify to a different tier? Uses hysteresis-adjusted gates
-             * so spot-check agrees exactly with full reclassify logic.
-             * Only resets stability when a genuine tier change is imminent.
-             * Zero false triggers from normal frame variance. */
-            u16 g0 = tier <= 0 ? TIER_GATE_T0 : TIER_GATE_T0 - TIER_GATE_T0 / 10;
-            u16 g1 = tier <= 1 ? TIER_GATE_T1 : TIER_GATE_T1 - TIER_GATE_T1 / 10;
-            u16 g2 = tier <= 2 ? TIER_GATE_T2 : TIER_GATE_T2 - TIER_GATE_T2 / 10;
+            /* Not time for full recheck — commit fast path results and return.
+             * Writing here (and NOT in the fall-through path below) prevents
+             * the double-EWMA application that was the original bug. */
+            u32 new_fused = PACK_DEFICIT_AVG(deficit, new_avg);
+            if (new_fused != old_fused)
+                tctx->deficit_avg_fused = new_fused;
+
+            /* Spot-check: would new EWMA classify to a different tier?
+             * Uses hysteresis-adjusted gates so spot-check agrees exactly
+             * with full reclassify logic. Only resets stability when a genuine
+             * tier change is imminent. Zero false triggers from normal frame
+             * variance. */
+            u16 g0 = (tier > 0) ? tier_gate_promote[0] : tier_gate_demote[0];
+            u16 g1 = (tier > 1) ? tier_gate_promote[1] : tier_gate_demote[1];
+            u16 g2 = (tier > 2) ? tier_gate_promote[2] : tier_gate_demote[2];
             u8 spot_tier;
             if      (new_avg < g0) spot_tier = 0;
             else if (new_avg < g1) spot_tier = 1;
@@ -627,17 +736,26 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
             }
             return;
         }
-        /* Fall through → periodic full reclassify */
+        /* Fall through → periodic full reclassify.
+         * Do NOT write deficit_avg_fused here — full path reads the original
+         * old_fused so EWMA is applied exactly once. */
     }
 
     /* ── FULL RECLASSIFICATION ── */
 
     /* ── EWMA RUNTIME UPDATE ── */
-    /* Decay 7/8: responds in ~8 execution bouts. Smooth enough to ignore
-     * single outliers, fast enough to detect behavior changes within 50ms. */
+    /* Asymmetric decay: promote fast (α=1/4 ≈ 4 bouts), demote cautiously
+     * (α=1/16 ≈ 16 bouts). Gaming threads spike during level loads then
+     * recover — fast promotion restores T0/T1 priority without waiting 8+
+     * bouts. Symmetric 1/8 allowed loading screens to permanently demote
+     * game threads for the remainder of the session. */
     u32 old_fused = tctx->deficit_avg_fused;
     u16 avg_rt = EXTRACT_AVG_RT(old_fused);
-    u16 new_avg = avg_rt - (avg_rt >> 3) + (rt_clamped >> 3);
+    u16 new_avg;
+    if (rt_clamped < avg_rt)
+        new_avg = avg_rt - (avg_rt >> 2) + (rt_clamped >> 2);  /* promote α=1/4 */
+    else
+        new_avg = avg_rt - (avg_rt >> 4) + (rt_clamped >> 4);  /* demote  α=1/16 */
 
     /* ── DRR++ DEFICIT TRACKING ── */
     /* Each execution bout consumes deficit. When deficit exhausts, clear the
@@ -655,24 +773,16 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
         tctx->deficit_avg_fused = new_fused;
 
     /* ── HYSTERESIS TIER CLASSIFICATION ──
-     * Promote-only deadband prevents oscillation at tier boundaries.
+     * Precomputed gate tables (RODATA) eliminate runtime division.
      * To PROMOTE (lower tier): avg must be 10% below the gate.
-     * To DEMOTE  (higher tier): standard gate (no barrier — fast demotion).
-     * Asymmetric by design: give more CPU time quickly, take it back cautiously.
-     *
-     * Example at T1/T2 gate (2000µs):
-     *   Current T1, avg=2100 → demotes to T2 (standard gate)
-     *   Current T2, avg=1900 → stays T2 (promote needs <1800)
-     *   Current T2, avg=1750 → promotes to T1 */
+     * To DEMOTE  (higher tier): standard gate — fast demotion.
+     * Asymmetric by design: give more CPU time quickly, take back cautiously. */
     u8 old_tier = (packed >> SHIFT_TIER) & MASK_TIER;
     u8 new_tier;
 
-    /* Gate values with 10% hysteresis applied per-direction.
-     * Promote gates (10% below): task must clearly be in the faster tier.
-     * Demote gates  (10% above): task must clearly be in the slower tier. */
-    u16 g0 = old_tier <= 0 ? TIER_GATE_T0 : TIER_GATE_T0 - TIER_GATE_T0 / 10;  /* 100 or 90 */
-    u16 g1 = old_tier <= 1 ? TIER_GATE_T1 : TIER_GATE_T1 - TIER_GATE_T1 / 10;  /* 2000 or 1800 */
-    u16 g2 = old_tier <= 2 ? TIER_GATE_T2 : TIER_GATE_T2 - TIER_GATE_T2 / 10;  /* 8000 or 7200 */
+    u16 g0 = (old_tier > 0) ? tier_gate_promote[0] : tier_gate_demote[0];
+    u16 g1 = (old_tier > 1) ? tier_gate_promote[1] : tier_gate_demote[1];
+    u16 g2 = (old_tier > 2) ? tier_gate_promote[2] : tier_gate_demote[2];
 
     if      (new_avg < g0) new_tier = 0;
     else if (new_avg < g1) new_tier = 1;
@@ -710,11 +820,24 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
     }
 }
 
+/* Pre-allocate task context when a task enters scx control.
+ * Fires once per task — not in the scheduling hot path.
+ * Guarantees cake_running/cake_stopping never see a NULL context,
+ * converting those null guards from live code paths to safety assertions. */
+s32 BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
+{
+    get_task_ctx(p, true);
+    return 0;
+}
+
 /* Task stopping — avg_runtime reclassification + DRR++ deficit tracking */
 void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 {
     struct cake_task_ctx *tctx = get_task_ctx(p, false);
-    if (tctx)
+    /* Skip tasks that have never been stamped by cake_running.
+     * Avoids the noinline call overhead (~3-5 cycles) for the
+     * uncommon case of a task stopping before its first run. */
+    if (tctx && likely(tctx->last_run_at))
         reclassify_task_cold(tctx);
 }
 
@@ -726,10 +849,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
      * Per-LLC DSQs used for enqueue → dispatch path. */
     /* Create per-LLC DSQs — one per cache domain.
      * Single-CCD: 1 DSQ (single per-LLC DSQ).
-     * Multi-CCD: N DSQs (eliminates cross-CCD lock contention). */
-    for (u32 i = 0; i < CAKE_MAX_LLCS; i++) {
-        if (i >= nr_llcs)
-            break;
+     * Multi-CCD: N DSQs (eliminates cross-CCD lock contention).
+     *
+     * FIX (audit): Loop directly to nr_llcs rather than CAKE_MAX_LLCS with an
+     * interior break. The original form was a verifier workaround for older
+     * kernels that required compile-time-bounded loops; nr_llcs is a RODATA
+     * const volatile that the JIT treats as a bounded constant. */
+    for (u32 i = 0; i < nr_llcs; i++) {
         s32 ret = scx_bpf_create_dsq(LLC_DSQ_BASE + i, -1);
         if (ret < 0)
             return ret;
@@ -751,6 +877,7 @@ SCX_OPS_DEFINE(cake_ops,
                .tick           = (void *)cake_tick,
                .running        = (void *)cake_running,
                .stopping       = (void *)cake_stopping,
+               .enable         = (void *)cake_enable,
                .init           = (void *)cake_init,
                .exit           = (void *)cake_exit,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,

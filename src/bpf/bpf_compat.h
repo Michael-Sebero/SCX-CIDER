@@ -79,9 +79,25 @@
     }
     #define BIT_SCAN_FORWARD_U64(mask) cake_ctz64(mask, 0x022FDD63CC95386DULL)
     #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) cake_ctz64(mask, mult)
+
+    /* FIX (#15): U32-specific BSF using De Bruijn sequence for 32-bit masks.
+     * Avoids zero-extending u32 into the 64-bit De Bruijn table which uses a
+     * 64-bit multiplier — correct by accident but semantically wrong. */
+    static __always_inline u32 cake_ctz32(u32 mask) {
+        static const u8 de_bruijn32[32] = {
+            0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+            31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
+        };
+        u32 lsb = mask & (u32)(-(s32)mask);
+        asm volatile("" : "+r"(lsb));
+        return de_bruijn32[(lsb * 0x077CB531U) >> 27];
+    }
+    #define BIT_SCAN_FORWARD_U32(mask) cake_ctz32(mask)
 #else
     #define BIT_SCAN_FORWARD_U64(mask) __builtin_ctzll(mask)
     #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) __builtin_ctzll(mask)
+    /* FIX (#15): Use __builtin_ctz for u32 operands (correct width, avoids implicit widening) */
+    #define BIT_SCAN_FORWARD_U32(mask) __builtin_ctz(mask)
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -92,16 +108,6 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define CAKE_PREFETCH(addr) \
     asm volatile("" : : "r"(addr))
-
-/* DSQ peek compat - v6.19+ uses native, older kernels use noinline iterator fallback */
-/* Prototype for scratch-tunneled version in cake.bpf.c */
-struct task_struct *cake_bpf_dsq_peek_legacy(u64 dsq_id);
-
-static __always_inline struct task_struct *cake_bpf_dsq_peek(u64 dsq_id) {
-    if (bpf_ksym_exists(scx_bpf_dsq_peek))
-        return scx_bpf_dsq_peek(dsq_id);
-    return cake_bpf_dsq_peek_legacy(dsq_id);
-}
 
 /* rq access — scx_bpf_cpu_rq() is universally available (~10-15ns).
  *
