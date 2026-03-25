@@ -65,7 +65,7 @@ CIDER inherits CAKE's full scheduling pipeline and adds three context-signal lay
 Hardware event
       │
       ▼
-cider_select_cpu ─── [NEW] IRQ detection ────────────────► CAKE_FLOW_IRQ_WAKE flag
+cake_select_cpu ─── [NEW] IRQ detection ────────────────► CAKE_FLOW_IRQ_WAKE flag
       │                    (bpf_in_hardirq / bpf_in_serving_softirq / ksoftirqd)
       │
       ├── SYNC fast path ──► dispatch_sync_cold ─── [NEW] consume IRQ_WAKE → T0 slice
@@ -75,7 +75,7 @@ cider_select_cpu ─── [NEW] IRQ detection ───────────
       └── All busy ─────────────────────────────────────────────────┐
                                                                      │
                                                                      ▼
-                                                              cider_enqueue
+                                                              cake_enqueue
                                                                      │
                                                          [NEW] Feature 1: IRQ tier override
                                                          [NEW] Feature 2: Waker tier inheritance
@@ -85,13 +85,13 @@ cider_select_cpu ─── [NEW] IRQ detection ───────────
                                                          per-LLC DSQ (vtime = tier<<56 | ts)
                                                                      │
                                                                      ▼
-                                                              cider_dispatch
+                                                              cake_dispatch
                                                                      │
-                                                              cider_running
+                                                              cake_running
                                                                      │
-                                                              cider_tick ──── [NEW] Lock holder starvation skip
+                                                              cake_tick ──── [NEW] Lock holder starvation skip
                                                                      │
-                                                              cider_stopping (reclassify_task_cold)
+                                                              cake_stopping (reclassify_task_cold)
                                                               EWMA update → behavioral tier for next dispatch
 
 Futex acquire/release (any time, via fexit probes in lock_bpf.c):
@@ -100,7 +100,7 @@ Futex acquire/release (any time, via fexit probes in lock_bpf.c):
 
 ### The 4-tier system (unchanged from CAKE)
 
-Tasks are classified into four tiers purely by EWMA of `avg_runtime_us`, computed at every `cider_stopping` call:
+Tasks are classified into four tiers purely by EWMA of `avg_runtime_us`, computed at every `cake_stopping` call:
 
 | Tier | Name | Runtime gate | Typical tasks |
 | :--- | :--- | :----------- | :------------ |
@@ -115,9 +115,9 @@ Tiers are encoded in vtime bits [63:56], ensuring T0 tasks always drain before T
 
 #### Layer 1: IRQ-source wakeup boost
 
-**Where:** `cider_select_cpu`, and all three dispatch paths that bypass `cider_enqueue`.
+**Where:** `cake_select_cpu`, and all three dispatch paths that bypass `cake_enqueue`.
 
-**What:** When a wakeup originates from a hardirq, NMI, softirq bottom-half, or a `ksoftirqd` kernel thread, the task is flagged with `CAKE_FLOW_IRQ_WAKE` atomically on its `packed_info`. This flag is consumed (cleared) on whichever dispatch path fires first — SYNC direct dispatch, idle direct dispatch, or `cider_enqueue` — and grants T0 tier priority for that one dispatch only.
+**What:** When a wakeup originates from a hardirq, NMI, softirq bottom-half, or a `ksoftirqd` kernel thread, the task is flagged with `CAKE_FLOW_IRQ_WAKE` atomically on its `packed_info`. This flag is consumed (cleared) on whichever dispatch path fires first — SYNC direct dispatch, idle direct dispatch, or `cake_enqueue` — and grants T0 tier priority for that one dispatch only.
 
 **Why:** A mouse click interrupt completes, the kernel wakes the input handler, and the input handler should run at T0 immediately. Without this signal, the handler waits for its EWMA to settle across 3–5 bouts. With it, the first dispatch is always T0 regardless of history.
 
@@ -125,9 +125,9 @@ The flag is strictly one-shot and never touches the EWMA. The behavioral classif
 
 #### Layer 2: Waker tier inheritance
 
-**Where:** `cider_enqueue`, on `SCX_ENQ_WAKEUP` paths only.
+**Where:** `cake_enqueue`, on `SCX_ENQ_WAKEUP` paths only.
 
-**What:** When a wakeup enqueue fires, the waker's tier is read from `mega_mailbox[enq_cpu].flags` (set by `cider_tick` on every timer tick). If the waker's tier is lower than the wakee's, the wakee is promoted to at most `waker_tier + 1` for this dispatch only.
+**What:** When a wakeup enqueue fires, the waker's tier is read from `mega_mailbox[enq_cpu].flags` (set by `cake_tick` on every timer tick). If the waker's tier is lower than the wakee's, the wakee is promoted to at most `waker_tier + 1` for this dispatch only.
 
 **Why:** A T0 input handler wakes a T2 game event dispatcher. Without inheritance, the dispatcher sits in the T2 queue for up to 40ms. With inheritance, it runs at T1 for this dispatch. The EWMA will independently converge toward T1 if this producer–consumer pattern is consistent.
 
@@ -135,13 +135,13 @@ Constraints: only on wakeup (not preempt or yield); never promotes above T0; nev
 
 #### Layer 3: Futex lock-holder protection
 
-**Where:** `lock_bpf.c` (fexit probes set/clear the flag), `cider_enqueue` (vtime advance), `cider_tick` (starvation skip).
+**Where:** `lock_bpf.c` (fexit probes set/clear the flag), `cake_enqueue` (vtime advance), `cake_tick` (starvation skip).
 
 **What:** `fexit` probes on all futex acquire/release functions detect when a task holds a contended lock. `CAKE_FLAG_LOCK_HOLDER` is set atomically in `packed_info` on acquisition and cleared on release. Two effects follow:
 
-1. **Vtime advance** (`cider_enqueue`): the lock holder's virtual timestamp is subtracted by `new_flow_bonus_ns` within its tier, sorting it ahead of same-tier non-holders. It runs sooner and releases the lock faster. The tier itself is unchanged — a T3 bulk task with a lock is not promoted to T0, it just moves to the front of the T3 queue.
+1. **Vtime advance** (`cake_enqueue`): the lock holder's virtual timestamp is subtracted by `new_flow_bonus_ns` within its tier, sorting it ahead of same-tier non-holders. It runs sooner and releases the lock faster. The tier itself is unchanged — a T3 bulk task with a lock is not promoted to T0, it just moves to the front of the T3 queue.
 
-2. **Starvation skip** (`cider_tick`): if the lock holder exceeds its starvation threshold, the preemption kick is skipped. The unconditional slice expiry check (`runtime > next_slice`) still applies as a hard ceiling.
+2. **Starvation skip** (`cake_tick`): if the lock holder exceeds its starvation threshold, the preemption kick is skipped. The unconditional slice expiry check (`runtime > next_slice`) still applies as a hard ceiling.
 
 **Why:** Preempting a lock holder causes priority inversion. Every task waiting on the lock is blocked until the holder is rescheduled and releases it — which may be longer than just letting the holder finish its critical section in the first place. Wine/Proton holds D3D command-list mutexes across full frame submissions. Audio frameworks hold mixing locks during T0 callbacks. This mechanism makes lock-holder behavior predictable without requiring application annotation.
 
@@ -166,20 +166,20 @@ Counts are estimates based on BPF instruction complexity (x86_64 JIT).
 
 | Function | Role | Frequency | CAKE Cost | **CIDER Cost** | Delta |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`cider_select_cpu`** | Core pick + IRQ detect | High | ~5c | **~26c** | **+21c** |
-| **`cider_enqueue`** | Wakeup dispatch | Extreme | ~2c | **~8c** | **+6c** |
-| `cider_dispatch` | DSQ consume | Very high | ~5c | **~5c** | 0 |
-| `cider_tick` | Slice/starvation check | High | ~55c | **~57c** | +2c |
-| `cider_stopping` | EWMA + reclassify | High | ~85c | **~85c** | 0 |
-| `cider_running` | Timestamp stamp | High | ~50c | **~50c** | 0 |
+| **`cake_select_cpu`** | Core pick + IRQ detect | High | ~5c | **~26c** | **+21c** |
+| **`cake_enqueue`** | Wakeup dispatch | Extreme | ~2c | **~8c** | **+6c** |
+| `cake_dispatch` | DSQ consume | Very high | ~5c | **~5c** | 0 |
+| `cake_tick` | Slice/starvation check | High | ~55c | **~57c** | +2c |
+| `cake_stopping` | EWMA + reclassify | High | ~85c | **~85c** | 0 |
+| `cake_running` | Timestamp stamp | High | ~50c | **~50c** | 0 |
 | `lock_bpf` probes | Futex set/clear | Low | 0 | **~50ns fexit** | new |
 | **Total Round Trip** | **End-to-End** | **Per Task** | **~137c** | **~164c** | **+20%** |
 
-The +20% increase is entirely in `select_cpu` and `enqueue`, which are the two callsites that now carry context-signal processing. The critical `cider_dispatch` path (the tightest loop under sustained load) is unchanged.
+The +20% increase is entirely in `select_cpu` and `enqueue`, which are the two callsites that now carry context-signal processing. The critical `cake_dispatch` path (the tightest loop under sustained load) is unchanged.
 
 ---
 
-### 1. `cider_select_cpu` (Wakeup Decision + IRQ Detection)
+### 1. `cake_select_cpu` (Wakeup Decision + IRQ Detection)
 
 **Frequency:** High
 **Change:** IRQ context detection adds one unconditional map lookup.
@@ -198,7 +198,7 @@ The +21c cost is the price of one bpf_task_storage_get. It is unavoidable if we 
 
 ---
 
-### 2. `cider_enqueue` (Task Wakeup — All-Busy Path)
+### 2. `cake_enqueue` (Task Wakeup — All-Busy Path)
 
 **Frequency:** Extreme (every wakeup when no idle CPU)
 **Change:** Three feature checks added after the existing tier lookup.
@@ -222,7 +222,7 @@ The steady-state cost on a gaming system (no lock holders, occasional IRQ wakes)
 
 ---
 
-### 3. `cider_dispatch` (Hot Path)
+### 3. `cake_dispatch` (Hot Path)
 
 **Frequency:** Very High
 **Change:** None.
@@ -235,7 +235,7 @@ The steady-state cost on a gaming system (no lock holders, occasional IRQ wakes)
 
 ---
 
-### 4. `cider_tick` (Starvation + Lock Check)
+### 4. `cake_tick` (Starvation + Lock Check)
 
 **Frequency:** High (every scheduler tick under load)
 **Change:** Lock holder check before starvation kick.
@@ -243,7 +243,7 @@ The steady-state cost on a gaming system (no lock holders, occasional IRQ wakes)
 | Operation | Type | Cost | Notes |
 | :--- | :--- | :--- | :--- |
 | Runtime computation | ALU | 3 | Unchanged |
-| `cider_get_rq` + `nr_running` read | Helper+L1 | 20 | Graduated backoff (unchanged) |
+| `cake_get_rq` + `nr_running` read | Helper+L1 | 20 | Graduated backoff (unchanged) |
 | Starvation threshold unpack | ALU | 2 | RODATA access (unchanged) |
 | `packed_info` load (lock check) | L1 Load | 1 | **New: only when starvation would fire** |
 | LOCK_HOLDER flag test | ALU | 1 | **New: `unlikely()` — zero on common path** |
@@ -255,7 +255,7 @@ The lock holder check adds exactly 2 cycles to the starvation-exceeded branch (`
 
 ---
 
-### 5. `cider_stopping` (EWMA + Reclassification)
+### 5. `cake_stopping` (EWMA + Reclassification)
 
 **Frequency:** High (every context switch)
 **Change:** None. The EWMA classification is deliberately unchanged — context signals are layered *on top of* the EWMA result, not mixed into it.
@@ -344,7 +344,7 @@ The following table covers the original CAKE architecture experiments. The conte
 | Strategy | Key Logic | IPC | RES/sec | Verdict |
 | :--- | :--- | :--- | :--- | :--- |
 | Baseline (EEVDF) | CFS/EEVDF Defaults | 0.85 | ~15 | Gold Standard |
-| Original scx_cider | Complex Idle Hunt + Preemption Injection | 0.95 | ~1600 | IPI Storm |
+| Original scx_cake | Complex Idle Hunt + Preemption Injection | 0.95 | ~1600 | IPI Storm |
 | Simplified | Sync Wake + Sticky Pref | 0.51 | ~1450 | Regression |
 | Aggressive Local | Always current_cpu | 0.50 | ~4 | Serialized |
 | Hybrid | Sync Wake + Global Idle Hunt | 1.00 | ~1300 | Parallelism restored |
