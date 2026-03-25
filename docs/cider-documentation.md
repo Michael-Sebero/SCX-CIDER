@@ -23,7 +23,7 @@ Each word maps directly to a real mechanism in the scheduler:
 
 ### From CAKE to CIDER: the philosophical shift
 
-The original `scx_cider` had a single governing insight: **unfairness is a feature**. A scheduler optimized for gaming should not treat a background compiler and an audio callback as equals. Tasks earn their tier by *behavioral evidence* — the EWMA of their actual runtime. Short runtimes indicate latency sensitivity; long runtimes indicate bulk work. Tiers encoded in vtime do the rest.
+The original `scx_cake` had a single governing insight: **unfairness is a feature**. A scheduler optimized for gaming should not treat a background compiler and an audio callback as equals. Tasks earn their tier by *behavioral evidence* — the EWMA of their actual runtime. Short runtimes indicate latency sensitivity; long runtimes indicate bulk work. Tiers encoded in vtime do the rest.
 
 This philosophy was correct but **context-blind**. CAKE knew how long tasks historically ran, but nothing about the circumstances of any specific wakeup. Two problems followed:
 
