@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// scx_cake - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
+// scx_cider - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
 
 mod calibrate;
 mod stats;
@@ -184,7 +184,7 @@ impl Profile {
     }
 }
 
-/// 🍰 scx_cake: A sched_ext scheduler applying CAKE bufferbloat concepts
+/// 🍰 scx_cider: A sched_ext scheduler applying CAKE bufferbloat concepts
 ///
 /// This scheduler adapts CAKE's DRR++ (Deficit Round Robin++) algorithm
 /// for CPU scheduling, providing low-latency scheduling for gaming and
@@ -199,10 +199,10 @@ impl Profile {
 ///   T3 Bulk      (≥8ms):   compilation, background
 ///
 /// EXAMPLES:
-///   scx_cake                          # Run with gaming profile (default)
-///   scx_cake -p esports               # Ultra-low-latency for competitive play
-///   scx_cake --quantum 1500           # Gaming profile with custom quantum
-///   scx_cake -v                       # Run with live TUI stats display
+///   scx_cider                          # Run with gaming profile (default)
+///   scx_cider -p esports               # Ultra-low-latency for competitive play
+///   scx_cider --quantum 1500           # Gaming profile with custom quantum
+///   scx_cider -v                       # Run with live TUI stats display
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -370,7 +370,7 @@ impl<'a> Scheduler<'a> {
             // proportionally when the CLI arg is present.
             rodata.tier_configs = args.profile.tier_configs(quantum, args.starvation);
 
-            // Topology: only has_hybrid is live (DVFS scaling in cake_tick)
+            // Topology: only has_hybrid is live (DVFS scaling in cider_tick)
             rodata.has_hybrid = topo.has_hybrid_cores;
 
             // Per-LLC DSQ partitioning: populate CPU→LLC mapping
@@ -398,7 +398,7 @@ impl<'a> Scheduler<'a> {
         let _link = self
             .skel
             .maps
-            .cake_ops
+            .cider_ops
             .attach_struct_ops()
             .context("Failed to attach scheduler")?;
 
@@ -478,7 +478,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        info!("scx_cake scheduler shutting down");
+        info!("scx_cider scheduler shutting down");
         Ok(())
     }
 

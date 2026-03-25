@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# scx_cake Interactive Benchmark Suite
+# scx_cider Interactive Benchmark Suite
 # =============================================================================
 #
-# A unified tool to benchmark scx_cake performance against baseline EEVDF.
+# A unified tool to benchmark scx_cider performance against baseline EEVDF.
 # All functionality is self-contained.
 #
 # Usage: sudo ./scripts/benchmark.sh
@@ -45,10 +45,10 @@ mkdir -p "$LOG_DIR"
 
 get_bpf_stats() {
     bpftool prog show 2>/dev/null | awk '
-    /struct_ops.*name cake_/ {
+    /struct_ops.*name cider_/ {
         for (i=1; i<=NF; i++) {
-            if ($i == "name" && $(i+1) ~ /^cake_/) {
-                gsub(/^cake_/, "", $(i+1))
+            if ($i == "name" && $(i+1) ~ /^cider_/) {
+                gsub(/^cider_/, "", $(i+1))
                 name = $(i+1)
             }
         }
@@ -108,7 +108,7 @@ get_cpu_freq() {
 }
 
 get_binary_size() {
-    local binary="$PROJECT_DIR/target/release/scx_cake"
+    local binary="$PROJECT_DIR/target/release/scx_cider"
     if [ -f "$binary" ]; then
         stat -c%s "$binary"
     else
@@ -157,7 +157,7 @@ get_perf_stats() {
 print_menu_header() {
     clear
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}              ${BOLD}scx_cake Interactive Benchmark Suite${NC}                    ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}              ${BOLD}scx_cider Interactive Benchmark Suite${NC}                    ${BOLD}${CYAN}║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -165,7 +165,7 @@ print_menu_header() {
 print_monitor_header() {
     local interval=$1
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}              ${BOLD}scx_cake Performance Monitor${NC}                                    ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}              ${BOLD}scx_cider Performance Monitor${NC}                                    ${BOLD}${CYAN}║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo -e "${DIM}Interval: ${interval}s | $(date '+%Y-%m-%d %H:%M:%S') | Press Ctrl+C to stop${NC}"
     echo
@@ -324,7 +324,7 @@ run_monitor_internal() {
     echo 1 > /proc/sys/kernel/bpf_stats_enabled 2>/dev/null || true
 
     # Header for log (JSON)
-    printf '{"type": "header", "scheduler": "scx_cake", "mode": "%s", "duration": %d, "timestamp": "%s", "kernel": "%s", "host": "%s"}\n' \
+    printf '{"type": "header", "scheduler": "scx_cider", "mode": "%s", "duration": %d, "timestamp": "%s", "kernel": "%s", "host": "%s"}\n' \
         "$name" "$duration" "$(date -Iseconds)" "$(uname -r)" "$(hostname)" > "$log_file"
 
     # Internal state for deltas
@@ -532,20 +532,20 @@ get_scheduler() {
 }
 
 stop_scx() {
-    if pgrep scx_cake >/dev/null; then
-        echo -e "${YELLOW}Stopping scx_cake...${NC}"
-        pkill -SIGINT scx_cake || true
+    if pgrep scx_cider >/dev/null; then
+        echo -e "${YELLOW}Stopping scx_cider...${NC}"
+        pkill -SIGINT scx_cider || true
         sleep 2
-        if pgrep scx_cake >/dev/null; then
-            pkill -9 scx_cake || true
+        if pgrep scx_cider >/dev/null; then
+            pkill -9 scx_cider || true
             sleep 1
         fi
     fi
 }
 
 start_scx() {
-    if ! pgrep scx_cake >/dev/null; then
-        echo -e "${GREEN}Starting scx_cake...${NC}"
+    if ! pgrep scx_cider >/dev/null; then
+        echo -e "${GREEN}Starting scx_cider...${NC}"
         # Assuming start.sh is in parent dir
         if [ ! -f "$START_SCRIPT" ]; then
              echo -e "${RED}Error: start.sh not found at $START_SCRIPT${NC}"
@@ -554,14 +554,14 @@ start_scx() {
         
         nohup "$START_SCRIPT" >/dev/null 2>&1 &
         sleep 2
-        if ! pgrep scx_cake >/dev/null; then
-            echo -e "${RED}Failed to start scx_cake! Check logs.${NC}"
+        if ! pgrep scx_cider >/dev/null; then
+            echo -e "${RED}Failed to start scx_cider! Check logs.${NC}"
             read -p "Press Enter to continue..."
             return 1
         fi
-        echo -e "${GREEN}scx_cake started successfully.${NC}"
+        echo -e "${GREEN}scx_cider started successfully.${NC}"
     else
-        echo -e "${GREEN}scx_cake is already running.${NC}"
+        echo -e "${GREEN}scx_cider is already running.${NC}"
     fi
     return 0
 }
@@ -613,7 +613,7 @@ compare_logs() {
     echo "  LLC Miss Rate:    ${llc_miss_1}%"
     
     echo ""
-    echo -e "${BOLD}scx_cake:${NC}"
+    echo -e "${BOLD}scx_cider:${NC}"
     
     local cs_avg_2=$(awk '/"context_switches_sec":/ {sum+=$6; count++} END {if (count>0) print int(sum/count)}' "$log2" | tr -d ',')
     local overhead_2=$(awk '/"overhead_pct":/ {sum+=$NF; count++} END {if (count>0) print sum/count}' "$log2" | tr -d '}')
@@ -661,7 +661,7 @@ if [ "$1" == "--headless" ]; then
             run_capture_wrapper "$DURATION" "$SUFFIX"
             exit 0
             ;;
-        *) echo "Headless target not supported (only 3: scx_cake)"; exit 1 ;;
+        *) echo "Headless target not supported (only 3: scx_cider)"; exit 1 ;;
     esac
 fi
 
@@ -694,8 +694,8 @@ while true; do
     echo "Select Benchmark Target:"
     echo -e "  ${BOLD}1)${NC} Current Scheduler (Run on $CURRENT_SCHED)"
     echo -e "  ${BOLD}2)${NC} Baseline Only (Force EEVDF)"
-    echo -e "  ${BOLD}3)${NC} scx_cake Only (Force Load)"
-    echo -e "  ${BOLD}4)${NC} Compare (Baseline vs scx_cake)"
+    echo -e "  ${BOLD}3)${NC} scx_cider Only (Force Load)"
+    echo -e "  ${BOLD}4)${NC} Compare (Baseline vs scx_cider)"
     echo -e "  ${BOLD}b)${NC} Back"
     echo ""
     read -p "Select target: " target_opt
@@ -723,11 +723,11 @@ while true; do
             output1=$(run_capture_wrapper "$DURATION" "${SUFFIX}_baseline")
             log1=$(echo "$output1" | grep "LOG_FILE=" | cut -d= -f2 | tr -d '[:space:]')
             
-            echo -e "\n${BOLD}${MAGENTA}Phase 2: scx_cake${NC}"
+            echo -e "\n${BOLD}${MAGENTA}Phase 2: scx_cider${NC}"
             start_scx || continue
-            echo -e "${YELLOW}Scheduler loaded. Prepare for scx_cake capture in 3s...${NC}"
+            echo -e "${YELLOW}Scheduler loaded. Prepare for scx_cider capture in 3s...${NC}"
             sleep 3
-            output2=$(run_capture_wrapper "$DURATION" "${SUFFIX}_scx_cake")
+            output2=$(run_capture_wrapper "$DURATION" "${SUFFIX}_scx_cider")
             log2=$(echo "$output2" | grep "LOG_FILE=" | cut -d= -f2 | tr -d '[:space:]')
             
             if [ -f "$log1" ] && [ -f "$log2" ]; then

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * scx_cake/lock_bpf.c — Futex lock-holder priority boosting
+ * scx_cider/lock_bpf.c — Futex lock-holder priority boosting
  *
  * Adapted from LAVD (scx_lavd/lock.bpf.c) by Changwoo Min <changwoo@igalia.com>.
  * Ported to CAKE's packed_info flag model; fexit and tracepoint fallback paths
@@ -18,9 +18,9 @@
  *
  * Two effects are applied while CAKE_FLAG_LOCK_HOLDER is set:
  *
- *   1. cake_tick skips the starvation preemption check (lock_bpf.c sets the
- *      flag; cake_bpf.c reads it).
- *   2. cake_enqueue advances the virtual timestamp so the lock holder sorts
+ *   1. cider_tick skips the starvation preemption check (lock_bpf.c sets the
+ *      flag; cider_bpf.c reads it).
+ *   2. cider_enqueue advances the virtual timestamp so the lock holder sorts
  *      ahead of same-tier peers, unblocking waiters sooner.
  *
  * TRACING STRATEGY
@@ -55,12 +55,12 @@
 
 char _lock_license[] SEC("license") = "GPL";
 
-/* Shared task-context map (defined in cake_bpf.c, resolved by libbpf linker) */
+/* Shared task-context map (defined in cider_bpf.c, resolved by libbpf linker) */
 extern struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
-    __type(value, struct cake_task_ctx);
+    __type(value, struct cider_task_ctx);
 } task_ctx;
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
@@ -68,14 +68,14 @@ extern struct {
 static __always_inline void set_lock_holder(void)
 {
     struct task_struct *p = bpf_get_current_task_btf();
-    struct cake_task_ctx *tctx;
+    struct cider_task_ctx *tctx;
 
     if (!p)
         return;
 
     tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if (tctx)
-        /* Atomic OR: safe against concurrent reads in cake_tick/cake_enqueue */
+        /* Atomic OR: safe against concurrent reads in cider_tick/cider_enqueue */
         __sync_fetch_and_or(&tctx->packed_info,
                             (u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS);
 }
@@ -83,14 +83,14 @@ static __always_inline void set_lock_holder(void)
 static __always_inline void clear_lock_holder(void)
 {
     struct task_struct *p = bpf_get_current_task_btf();
-    struct cake_task_ctx *tctx;
+    struct cider_task_ctx *tctx;
 
     if (!p)
         return;
 
     tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if (tctx)
-        /* Atomic AND: safe against concurrent reads in cake_tick/cake_enqueue */
+        /* Atomic AND: safe against concurrent reads in cider_tick/cider_enqueue */
         __sync_fetch_and_and(&tctx->packed_info,
                              ~((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS));
 }
@@ -106,7 +106,7 @@ static __always_inline void clear_lock_holder(void)
 struct hrtimer_sleeper;
 
 SEC("?fexit/__futex_wait")
-int BPF_PROG(cake_fexit_futex_wait,
+int BPF_PROG(cider_fexit_futex_wait,
              u32 *uaddr, unsigned int flags, u32 val,
              struct hrtimer_sleeper *to, u32 bitset,
              int ret)
@@ -123,7 +123,7 @@ int BPF_PROG(cake_fexit_futex_wait,
 struct futex_vector;
 
 SEC("?fexit/futex_wait_multiple")
-int BPF_PROG(cake_fexit_futex_wait_multiple,
+int BPF_PROG(cider_fexit_futex_wait_multiple,
              struct futex_vector *vs, unsigned int count,
              struct hrtimer_sleeper *to,
              int ret)
@@ -139,7 +139,7 @@ int BPF_PROG(cake_fexit_futex_wait_multiple,
  * PI requeue wait — lock acquired on return value 0.
  */
 SEC("?fexit/futex_wait_requeue_pi")
-int BPF_PROG(cake_fexit_futex_wait_requeue_pi,
+int BPF_PROG(cider_fexit_futex_wait_requeue_pi,
              u32 *uaddr, unsigned int flags, u32 val,
              ktime_t *abs_time, u32 bitset, u32 *uaddr2,
              int ret)
@@ -155,7 +155,7 @@ int BPF_PROG(cake_fexit_futex_wait_requeue_pi,
  * int futex_lock_pi(u32 *uaddr, unsigned int flags, ktime_t *time, int trylock)
  */
 SEC("?fexit/futex_lock_pi")
-int BPF_PROG(cake_fexit_futex_lock_pi,
+int BPF_PROG(cider_fexit_futex_lock_pi,
              u32 *uaddr, unsigned int flags,
              ktime_t *time, int trylock,
              int ret)
@@ -171,7 +171,7 @@ int BPF_PROG(cake_fexit_futex_lock_pi,
  * int futex_wake(u32 *uaddr, unsigned int flags, int nr_wake, u32 bitset)
  */
 SEC("?fexit/futex_wake")
-int BPF_PROG(cake_fexit_futex_wake,
+int BPF_PROG(cider_fexit_futex_wake,
              u32 *uaddr, unsigned int flags,
              int nr_wake, u32 bitset,
              int ret)
@@ -186,7 +186,7 @@ int BPF_PROG(cake_fexit_futex_wake,
  *                  int nr_wake, int nr_wake2, int op)
  */
 SEC("?fexit/futex_wake_op")
-int BPF_PROG(cake_fexit_futex_wake_op,
+int BPF_PROG(cider_fexit_futex_wake_op,
              u32 *uaddr1, unsigned int flags, u32 *uaddr2,
              int nr_wake, int nr_wake2, int op,
              int ret)
@@ -202,7 +202,7 @@ int BPF_PROG(cake_fexit_futex_wake_op,
  * int futex_unlock_pi(u32 *uaddr, unsigned int flags)
  */
 SEC("?fexit/futex_unlock_pi")
-int BPF_PROG(cake_fexit_futex_unlock_pi,
+int BPF_PROG(cider_fexit_futex_unlock_pi,
              u32 *uaddr, unsigned int flags,
              int ret)
 {
@@ -224,12 +224,12 @@ int BPF_PROG(cake_fexit_futex_unlock_pi,
  */
 
 /* Per-CPU scratch for the futex op seen at sys_enter */
-struct cake_lock_scratch {
+struct cider_lock_scratch {
     int futex_op;
     u8  _pad[60]; /* cache-line isolated */
 } __attribute__((aligned(64)));
 
-struct cake_lock_scratch lock_scratch[CAKE_MAX_CPUS] SEC(".bss")
+struct cider_lock_scratch lock_scratch[CAKE_MAX_CPUS] SEC(".bss")
     __attribute__((aligned(64)));
 
 /* Futex op constants (from uapi/linux/futex.h) */
@@ -248,7 +248,7 @@ struct cake_lock_scratch lock_scratch[CAKE_MAX_CPUS] SEC(".bss")
 #define CAKE_FUTEX_CMD_MASK      (~(CAKE_FUTEX_PRIVATE_FLAG | CAKE_FUTEX_CLOCK_RT))
 #define CAKE_FUTEX_OP_INVALID    (-1)
 
-struct tp_cake_futex_enter {
+struct tp_cider_futex_enter {
     /* trace_entry fields (opaque here) */
     unsigned long long unused[2];
     int __syscall_nr;
@@ -257,14 +257,14 @@ struct tp_cake_futex_enter {
     u32 val;
 };
 
-struct tp_cake_futex_exit {
+struct tp_cider_futex_exit {
     unsigned long long unused[2];
     int __syscall_nr;
     long ret;
 };
 
 SEC("?tracepoint/syscalls/sys_enter_futex")
-int cake_tp_enter_futex(struct tp_cake_futex_enter *ctx)
+int cider_tp_enter_futex(struct tp_cider_futex_enter *ctx)
 {
     u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
     lock_scratch[cpu].futex_op = ctx->op;
@@ -272,7 +272,7 @@ int cake_tp_enter_futex(struct tp_cake_futex_enter *ctx)
 }
 
 SEC("?tracepoint/syscalls/sys_exit_futex")
-int cake_tp_exit_futex(struct tp_cake_futex_exit *ctx)
+int cider_tp_exit_futex(struct tp_cider_futex_exit *ctx)
 {
     u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
     int cmd = lock_scratch[cpu].futex_op & CAKE_FUTEX_CMD_MASK;
@@ -313,7 +313,7 @@ int cake_tp_exit_futex(struct tp_cake_futex_exit *ctx)
  * introduced in Linux 6.x as explicit syscall entries. */
 
 SEC("?tracepoint/syscalls/sys_exit_futex_wait")
-int cake_tp_exit_futex_wait(struct tp_cake_futex_exit *ctx)
+int cider_tp_exit_futex_wait(struct tp_cider_futex_exit *ctx)
 {
     if (ctx->ret == 0)
         set_lock_holder();
@@ -321,7 +321,7 @@ int cake_tp_exit_futex_wait(struct tp_cake_futex_exit *ctx)
 }
 
 SEC("?tracepoint/syscalls/sys_exit_futex_waitv")
-int cake_tp_exit_futex_waitv(struct tp_cake_futex_exit *ctx)
+int cider_tp_exit_futex_waitv(struct tp_cider_futex_exit *ctx)
 {
     if (ctx->ret >= 0)
         set_lock_holder();
@@ -329,7 +329,7 @@ int cake_tp_exit_futex_waitv(struct tp_cake_futex_exit *ctx)
 }
 
 SEC("?tracepoint/syscalls/sys_exit_futex_wake")
-int cake_tp_exit_futex_wake(struct tp_cake_futex_exit *ctx)
+int cider_tp_exit_futex_wake(struct tp_cider_futex_exit *ctx)
 {
     if (ctx->ret > 0)
         clear_lock_holder();

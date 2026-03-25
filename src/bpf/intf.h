@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* scx_cake BPF/userspace interface - shared data structures and constants */
+/* scx_cider BPF/userspace interface - shared data structures and constants */
 
 #ifndef __CAKE_INTF_H
 #define __CAKE_INTF_H
@@ -24,7 +24,7 @@ typedef signed long s64;
  * Tiers group tasks with similar scheduling needs. Classification is
  * purely by EWMA avg_runtime — shorter runtime = more latency-sensitive.
  * DRR++ deficit handles intra-tier fairness (yield vs preempt). */
-enum cake_tier {
+enum cider_tier {
     CAKE_TIER_CRITICAL  = 0,  /* <100µs:  IRQ, input, audio, network */
     CAKE_TIER_INTERACT  = 1,  /* <2ms:    compositor, physics, AI */
     CAKE_TIER_FRAME     = 2,  /* <8ms:    game render, encoding */
@@ -47,27 +47,27 @@ enum cake_tier {
  *   bit 0 (1<<0): CAKE_FLOW_NEW        new-flow bonus active; cleared on deficit exhaust
  *   bit 1 (1<<1): CAKE_FLAG_LOCK_HOLDER  task holds a futex; set/cleared atomically by
  *                                        fexit probes in lock_bpf.c via __sync_fetch_and_or/and.
- *                                        Prevents preemption in cake_tick; advances vtime in
- *                                        cake_enqueue to sort ahead of same-tier peers.
+ *                                        Prevents preemption in cider_tick; advances vtime in
+ *                                        cider_enqueue to sort ahead of same-tier peers.
  *   bit 2 (1<<2): CAKE_FLOW_IRQ_WAKE   one-shot: task was woken from hardirq/softirq context.
- *                                        Set in cake_select_cpu via bpf_in_hardirq/softirq helpers
+ *                                        Set in cider_select_cpu via bpf_in_hardirq/softirq helpers
  *                                        (adapted from LAVD lavd_select_cpu). Consumed in
- *                                        cake_enqueue to override tier=0 for this dispatch only.
+ *                                        cider_enqueue to override tier=0 for this dispatch only.
  *   bit 3 (1<<3): reserved
  *
  * Sources:
  *   CAKE_FLAG_LOCK_HOLDER — adapted from LAVD lock.bpf.c futex priority boosting.
  *   CAKE_FLOW_IRQ_WAKE    — adapted from LAVD lavd_select_cpu IRQ-context wakeup detection.
  * ═══════════════════════════════════════════════════════════════════════════ */
-enum cake_flow_flags {
+enum cider_flow_flags {
     CAKE_FLOW_NEW         = 1 << 0,  /* Task is newly created */
     CAKE_FLAG_LOCK_HOLDER = 1 << 1,  /* Task currently holds a futex */
     CAKE_FLOW_IRQ_WAKE    = 1 << 2,  /* Task was woken from IRQ/softirq context */
 };
 
-/* Per-task flow state - 64B aligned, first 16B coalesced for cake_stopping writes */
-struct cake_task_ctx {
-    /* --- Hot Write Group (cake_stopping) [Bytes 0-15] --- */
+/* Per-task flow state - 64B aligned, first 16B coalesced for cider_stopping writes */
+struct cider_task_ctx {
+    /* --- Hot Write Group (cider_stopping) [Bytes 0-15] --- */
     u64 next_slice;        /* 8B: Pre-computed slice (ns) */
 
     /* STATE FUSION: Union allows atomic u64 access to both state fields */
@@ -85,7 +85,7 @@ struct cake_task_ctx {
         u64 state_fused_u64;               /* 8B: Direct burst commit */
     };
 
-    /* --- Timestamp (cake_running) [Bytes 16-19] --- */
+    /* --- Timestamp (cider_running) [Bytes 16-19] --- */
     u32 last_run_at;       /* 4B: Last run timestamp (ns), wraps 4.2s */
 
     /* --- Graduated backoff counter [Bytes 20-21] --- */
@@ -100,7 +100,7 @@ struct cake_task_ctx {
  * TIER+STABLE adjacent → fused 4-bit clear/set in reclassify (2 ops vs 4) */
 #define SHIFT_KALMAN_ERROR  0
 #define SHIFT_WAIT_DATA     8
-#define SHIFT_FLAGS         24  /* 4 bits: flow flags (see cake_flow_flags above) */
+#define SHIFT_FLAGS         24  /* 4 bits: flow flags (see cider_flow_flags above) */
 #define SHIFT_TIER          28  /* 2 bits: tier 0-3 (coalesced with STABLE) */
 #define SHIFT_STABLE        30  /* 2 bits: tier-stability counter (0-3) */
 
@@ -143,14 +143,14 @@ struct cake_task_ctx {
  * Only flags (tier) and dsq_hint (DVFS cache) are actively used.
  * Reserved space kept at 64B for future per-CPU-write features. */
 struct mega_mailbox_entry {
-    u8 flags;              /* [1:0]=tier — written by cake_tick */
-    u8 dsq_hint;           /* DVFS perf target cache — written by cake_tick */
+    u8 flags;              /* [1:0]=tier — written by cider_tick */
+    u8 dsq_hint;           /* DVFS perf target cache — written by cider_tick */
     u8 tick_counter;       /* 2-tick starvation gate — alternates rq lookup */
     u8 __reserved[61];     /* Pad to 64B cache line, available for future use */
 } __attribute__((aligned(64)));
 
 /* Statistics shared with userspace */
-struct cake_stats {
+struct cider_stats {
     u64 nr_new_flow_dispatches;    /* Tasks dispatched from new-flow */
     u64 nr_old_flow_dispatches;    /* Tasks dispatched from old-flow */
     u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */

@@ -1,4 +1,4 @@
-/* scx_cake/bpf/bpf_compat.h */
+/* scx_cider/bpf/bpf_compat.h */
 #ifndef __CAKE_BPF_COMPAT_H
 #define __CAKE_BPF_COMPAT_H
 
@@ -7,16 +7,46 @@
 #if defined(__clang__) && __clang_major__ >= 21
 
     /* MODERN PATH: Formal Atomics (Max Performance) */
-    #define cake_relaxed_load_u32(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
-    #define cake_relaxed_store_u32(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
-    #define cake_relaxed_load_u64(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
-    #define cake_relaxed_store_u64(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
+    #define cider_relaxed_load_u8(ptr)       __atomic_load_n(ptr, __ATOMIC_RELAXED)
+    #define cider_relaxed_store_u8(ptr, v)   __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
+    #define cider_relaxed_load_u32(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
+    #define cider_relaxed_store_u32(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
+    #define cider_relaxed_load_u64(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
+    #define cider_relaxed_store_u64(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
 
 #else
 
     /* COMPAT PATH: Scalpel-Optimized Inline Assembly */
 
-    static __always_inline u32 cake_relaxed_load_u32(const volatile u32 *ptr) {
+    /* FIX (audit): u8 atomic helpers — prevents compiler from emitting non-atomic
+     * byte stores/loads on weakly-ordered architectures (ARM64).  Plain struct
+     * member assignment is not guaranteed to be atomic or visible to other CPUs
+     * without these wrappers, which is a data race under the C11 memory model.
+     * Used for mega_mailbox u8 fields (flags, dsq_hint, tick_counter) that are
+     * written by the owning CPU in cider_tick and read by other CPUs in cider_enqueue
+     * (waker-tier inheritance).  RELAXED semantics are sufficient here: no ordering
+     * with respect to surrounding memory operations is required — visibility alone
+     * is the goal.  __ATOMIC_RELAXED maps to a plain MOV on both x86 and ARM64;
+     * the "m"(*ptr) memory operand tells the compiler the location is live. */
+    static __always_inline u8 cider_relaxed_load_u8(const volatile u8 *ptr) {
+        u8 val;
+        asm volatile(
+            "%0 = *(u8 *)(%1 + 0)"
+            : "=r"(val)
+            : "r"(ptr), "m"(*ptr)
+        );
+        return val;
+    }
+
+    static __always_inline void cider_relaxed_store_u8(volatile u8 *ptr, u8 val) {
+        asm volatile(
+            "*(u8 *)(%1 + 0) = %2"
+            : "=m"(*ptr)
+            : "r"(ptr), "r"(val)
+        );
+    }
+
+    static __always_inline u32 cider_relaxed_load_u32(const volatile u32 *ptr) {
         u32 val;
         asm volatile(
             "%0 = *(u32 *)(%1 + 0)"
@@ -26,7 +56,7 @@
         return val;
     }
 
-    static __always_inline void cake_relaxed_store_u32(volatile u32 *ptr, u32 val) {
+    static __always_inline void cider_relaxed_store_u32(volatile u32 *ptr, u32 val) {
         asm volatile(
             "*(u32 *)(%1 + 0) = %2"
             : "=m"(*ptr)           /* Only this address modified */
@@ -34,7 +64,7 @@
         );
     }
 
-    static __always_inline u64 cake_relaxed_load_u64(const volatile u64 *ptr) {
+    static __always_inline u64 cider_relaxed_load_u64(const volatile u64 *ptr) {
         u64 val;
         asm volatile(
             "%0 = *(u64 *)(%1 + 0)"
@@ -44,7 +74,7 @@
         return val;
     }
 
-    static __always_inline void cake_relaxed_store_u64(volatile u64 *ptr, u64 val) {
+    static __always_inline void cider_relaxed_store_u64(volatile u64 *ptr, u64 val) {
         asm volatile(
             "*(u64 *)(%1 + 0) = %2"
             : "=m"(*ptr)
@@ -62,7 +92,7 @@
 
 /* BIT SCAN FORWARD (CTZ): Clang <19 fallback uses De Bruijn to avoid opcode 191 crash */
 #if defined(__clang__) && __clang_major__ < 19
-    static __always_inline u32 cake_ctz64(u64 mask, u64 mult) {
+    static __always_inline u32 cider_ctz64(u64 mask, u64 mult) {
         static const u8 de_bruijn_bits[64] = {
             0,  1,  2, 53,  3,  7, 54, 27, 4, 38, 41,  8, 34, 55, 48, 28,
             62, 5, 39, 46, 44, 42, 22,  9, 24, 35, 59, 56, 49, 18, 29, 11,
@@ -77,13 +107,13 @@
 
         return de_bruijn_bits[(lsb * mult) >> 58];
     }
-    #define BIT_SCAN_FORWARD_U64(mask) cake_ctz64(mask, 0x022FDD63CC95386DULL)
-    #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) cake_ctz64(mask, mult)
+    #define BIT_SCAN_FORWARD_U64(mask) cider_ctz64(mask, 0x022FDD63CC95386DULL)
+    #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) cider_ctz64(mask, mult)
 
     /* FIX (#15): U32-specific BSF using De Bruijn sequence for 32-bit masks.
      * Avoids zero-extending u32 into the 64-bit De Bruijn table which uses a
      * 64-bit multiplier — correct by accident but semantically wrong. */
-    static __always_inline u32 cake_ctz32(u32 mask) {
+    static __always_inline u32 cider_ctz32(u32 mask) {
         static const u8 de_bruijn32[32] = {
             0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
             31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
@@ -92,7 +122,7 @@
         asm volatile("" : "+r"(lsb));
         return de_bruijn32[(lsb * 0x077CB531U) >> 27];
     }
-    #define BIT_SCAN_FORWARD_U32(mask) cake_ctz32(mask)
+    #define BIT_SCAN_FORWARD_U32(mask) cider_ctz32(mask)
 #else
     #define BIT_SCAN_FORWARD_U64(mask) __builtin_ctzll(mask)
     #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) __builtin_ctzll(mask)
@@ -116,7 +146,7 @@
  * kernel doesn't export it. A __weak redeclaration CANNOT override the strong
  * one already seen from common.bpf.h. Until the scx team makes it __weak or
  * all kernels export it, we use cpu_rq. */
-static __always_inline struct rq *cake_get_rq(s32 cpu) {
+static __always_inline struct rq *cider_get_rq(s32 cpu) {
     return scx_bpf_cpu_rq(cpu);
 }
 

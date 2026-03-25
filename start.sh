@@ -1,14 +1,14 @@
 #!/bin/bash
-# Start script for scx_cake scheduler
+# Start script for scx_cider scheduler
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="$SCRIPT_DIR/target/release/scx_cake"
+BINARY="$SCRIPT_DIR/target/release/scx_cider"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
-    echo "Error: scx_cake requires root privileges to load BPF scheduler"
+    echo "Error: scx_cider requires root privileges to load BPF scheduler"
     echo "Please run: sudo $0 $@"
     exit 1
 fi
@@ -27,7 +27,7 @@ if [ ! -d "/sys/kernel/sched_ext" ]; then
     exit 1
 fi
 
-echo "=== Starting scx_cake scheduler ==="
+echo "=== Starting scx_cider scheduler ==="
 echo "Current scheduler: $(cat /sys/kernel/sched_ext/state 2>/dev/null || echo 'disabled')"
 echo ""
 

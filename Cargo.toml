@@ -1,5 +1,5 @@
 [package]
-name = "scx_cake"
+name = "scx_cider"
 version = "1.0.2"
 authors = ["RitzDaCat"]
 edition = "2021"
@@ -29,5 +29,5 @@ nix = { version = "0.30", features = ["signal", "poll"] }
 scx_cargo = { git = "https://github.com/sched-ext/scx", branch = "main", version = "1.0.27" }
 
 [[bin]]
-name = "scx_cake"
+name = "scx_cider"
 path = "src/main.rs"

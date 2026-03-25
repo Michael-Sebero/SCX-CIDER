@@ -22,13 +22,13 @@ use ratatui::{
 };
 use tachyonfx::{fx, EffectManager};
 
-use crate::bpf_skel::types::cake_stats;
+use crate::bpf_skel::types::cider_stats;
 use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
 use crate::topology::TopologyInfo;
 
-fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
-    let mut total: cake_stats = Default::default();
+fn aggregate_stats(skel: &BpfSkel) -> cider_stats {
+    let mut total: cider_stats = Default::default();
 
     if let Some(bss) = &skel.maps.bss_data {
         for s in &bss.global_stats {
@@ -399,7 +399,7 @@ fn render_startup_widgets(
         Line::from(vec![
             Span::styled(" 🍰 ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                "scx_cake ",
+                "scx_cider ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -832,7 +832,7 @@ impl<'a> Widget for LatencyTable<'a> {
 }
 
 /// Format stats as a copyable text string
-fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
+fn format_stats_for_clipboard(stats: &cider_stats, uptime: &str) -> String {
     let total_dispatches = stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches;
     let new_pct = if total_dispatches > 0 {
         (stats.nr_new_flow_dispatches as f64 / total_dispatches as f64) * 100.0
@@ -842,7 +842,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
 
     let mut output = String::new();
     output.push_str(&format!(
-        "=== scx_cake Statistics (Uptime: {}) ===\n\n",
+        "=== scx_cider Statistics (Uptime: {}) ===\n\n",
         uptime
     ));
     output.push_str(&format!(
@@ -868,7 +868,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
 }
 
 /// Draw the UI
-fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
+fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats) {
     let area = frame.area();
 
     // Create main layout: header, stats table, footer
@@ -920,7 +920,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     );
     let header = Paragraph::new(header_text).block(
         Block::default()
-            .title(" scx_cake Statistics ")
+            .title(" scx_cider Statistics ")
             .title_style(
                 Style::default()
                     .fg(Color::Cyan)
