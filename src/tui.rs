@@ -40,6 +40,11 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
                 total.nr_tier_dispatches[i] += s.nr_tier_dispatches[i];
                 total.nr_starvation_preempts_tier[i] += s.nr_starvation_preempts_tier[i];
             }
+
+            // New LAVD-derived feature counters
+            total.nr_lock_holder_skips += s.nr_lock_holder_skips;
+            total.nr_irq_wake_boosts += s.nr_irq_wake_boosts;
+            total.nr_waker_tier_boosts += s.nr_waker_tier_boosts;
         }
     }
 
@@ -854,6 +859,11 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
         ));
     }
 
+    output.push_str("\nLAVD-derived feature counters:\n");
+    output.push_str(&format!("  Lock-holder starvation skips : {}\n", stats.nr_lock_holder_skips));
+    output.push_str(&format!("  IRQ-source wakeup T0 boosts  : {}\n", stats.nr_irq_wake_boosts));
+    output.push_str(&format!("  Waker tier inheritance boosts: {}\n", stats.nr_waker_tier_boosts));
+
     output
 }
 
@@ -922,7 +932,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     frame.render_widget(header, layout[0]);
 
     // --- Stats Table ---
-    let header_cells = ["Tier", "Dispatches", "StarvPreempt"].iter().map(|h| {
+    let header_cells = ["Tier", "Dispatches", "StarvPreempt", "LockSkip", "IRQBoost", "WakerBoost"].iter().map(|h| {
         Cell::from(*h).style(
             Style::default()
                 .fg(Color::Yellow)
@@ -939,6 +949,11 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
                 Cell::from(*name).style(tier_style(i)),
                 Cell::from(format!("{}", stats.nr_tier_dispatches[i])),
                 Cell::from(format!("{}", stats.nr_starvation_preempts_tier[i])),
+                // Lock-holder skip and IRQ/waker boost counters are system-wide (not
+                // per-tier), so only show them on the T0 row to avoid duplication.
+                Cell::from(if i == 0 { format!("{}", stats.nr_lock_holder_skips) } else { String::new() }),
+                Cell::from(if i == 0 { format!("{}", stats.nr_irq_wake_boosts) } else { String::new() }),
+                Cell::from(if i == 0 { format!("{}", stats.nr_waker_tier_boosts) } else { String::new() }),
             ];
             Row::new(cells).height(1)
         })
@@ -950,6 +965,9 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
         ],
     )
     .header(header_row)
@@ -964,9 +982,12 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     // --- Summary ---
     let total_starvation: u64 = stats.nr_starvation_preempts_tier.iter().sum();
     let summary_text = format!(
-        " Dispatches: {} | Starvation preempts: {}",
+        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} | IRQ boosts: {} | Waker boosts: {}",
         stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches,
-        total_starvation
+        total_starvation,
+        stats.nr_lock_holder_skips,
+        stats.nr_irq_wake_boosts,
+        stats.nr_waker_tier_boosts,
     );
 
     let summary = Paragraph::new(summary_text).block(

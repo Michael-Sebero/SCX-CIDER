@@ -39,9 +39,30 @@ enum cake_tier {
 /* Per-LLC DSQ base — DSQ IDs are LLC_DSQ_BASE + llc_index (0..nr_llcs-1) */
 #define LLC_DSQ_BASE 200
 
-/* Flow state flags (only CAKE_FLOW_NEW currently used) */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * FLOW STATE FLAGS — live in the 4-bit FLAGS nibble of packed_info.
+ * SHIFT_FLAGS = 24, MASK_FLAGS = 0x0F → bits 24–27 of packed_info.
+ *
+ * Bit layout (packed_info bits 27:24):
+ *   bit 0 (1<<0): CAKE_FLOW_NEW        new-flow bonus active; cleared on deficit exhaust
+ *   bit 1 (1<<1): CAKE_FLAG_LOCK_HOLDER  task holds a futex; set/cleared atomically by
+ *                                        fexit probes in lock_bpf.c via __sync_fetch_and_or/and.
+ *                                        Prevents preemption in cake_tick; advances vtime in
+ *                                        cake_enqueue to sort ahead of same-tier peers.
+ *   bit 2 (1<<2): CAKE_FLOW_IRQ_WAKE   one-shot: task was woken from hardirq/softirq context.
+ *                                        Set in cake_select_cpu via bpf_in_hardirq/softirq helpers
+ *                                        (adapted from LAVD lavd_select_cpu). Consumed in
+ *                                        cake_enqueue to override tier=0 for this dispatch only.
+ *   bit 3 (1<<3): reserved
+ *
+ * Sources:
+ *   CAKE_FLAG_LOCK_HOLDER — adapted from LAVD lock.bpf.c futex priority boosting.
+ *   CAKE_FLOW_IRQ_WAKE    — adapted from LAVD lavd_select_cpu IRQ-context wakeup detection.
+ * ═══════════════════════════════════════════════════════════════════════════ */
 enum cake_flow_flags {
-    CAKE_FLOW_NEW = 1 << 0,  /* Task is newly created */
+    CAKE_FLOW_NEW         = 1 << 0,  /* Task is newly created */
+    CAKE_FLAG_LOCK_HOLDER = 1 << 1,  /* Task currently holds a futex */
+    CAKE_FLOW_IRQ_WAKE    = 1 << 2,  /* Task was woken from IRQ/softirq context */
 };
 
 /* Per-task flow state - 64B aligned, first 16B coalesced for cake_stopping writes */
@@ -79,7 +100,7 @@ struct cake_task_ctx {
  * TIER+STABLE adjacent → fused 4-bit clear/set in reclassify (2 ops vs 4) */
 #define SHIFT_KALMAN_ERROR  0
 #define SHIFT_WAIT_DATA     8
-#define SHIFT_FLAGS         24  /* 4 bits: flow flags */
+#define SHIFT_FLAGS         24  /* 4 bits: flow flags (see cake_flow_flags above) */
 #define SHIFT_TIER          28  /* 2 bits: tier 0-3 (coalesced with STABLE) */
 #define SHIFT_STABLE        30  /* 2 bits: tier-stability counter (0-3) */
 
@@ -134,7 +155,10 @@ struct cake_stats {
     u64 nr_old_flow_dispatches;    /* Tasks dispatched from old-flow */
     u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */
     u64 nr_starvation_preempts_tier[CAKE_TIER_MAX]; /* Per-tier starvation preempts */
-    u64 _pad[22];                  /* Pad to 256 bytes: (2+4+4+22)*8 = 256 */
+    u64 nr_lock_holder_skips;      /* Starvation preempts skipped for lock holders */
+    u64 nr_irq_wake_boosts;        /* IRQ-source wakeup tier-0 overrides */
+    u64 nr_waker_tier_boosts;      /* Wakee promotions via waker tier inheritance */
+    u64 _pad[19];                  /* Pad to 256 bytes: (2+4+4+3+19)*8 = 256 */
 } __attribute__((aligned(64)));
 
 /* Topology flags - enables zero-cost specialization (false = code path eliminated by verifier) */

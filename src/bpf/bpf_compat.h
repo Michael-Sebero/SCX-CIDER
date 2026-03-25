@@ -120,4 +120,21 @@ static __always_inline struct rq *cake_get_rq(s32 cpu) {
     return scx_bpf_cpu_rq(cpu);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * IRQ CONTEXT KFUNCS
+ *
+ * bpf_in_hardirq / bpf_in_nmi / bpf_in_serving_softirq are x86/arm64 kfuncs
+ * introduced in Linux 6.x. Declared __weak so the scheduler loads cleanly on
+ * kernels that do not export them — on those kernels the verifier substitutes
+ * a zero return (false), which silently disables IRQ-wake boosting without
+ * any code changes required. This mirrors the approach used by LAVD for the
+ * same helpers.
+ *
+ * WITHOUT these declarations Clang 21 (strict -Wimplicit-function-declaration)
+ * treats the call sites as undeclared identifiers and hard-errors the build.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+extern bool bpf_in_hardirq(void) __ksym __weak;
+extern bool bpf_in_nmi(void) __ksym __weak;
+extern bool bpf_in_serving_softirq(void) __ksym __weak;
+
 #endif /* __CAKE_BPF_COMPAT_H */

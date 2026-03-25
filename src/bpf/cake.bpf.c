@@ -307,23 +307,52 @@ s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags)
     if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
         return -1;
 
-    /* Use tier-adjusted slice, not raw quantum. Without this, the kernel's
-     * slice countdown preempts at 2ms before cake_tick can check the
-     * tier-adjusted threshold — making multipliers dead code for SYNC. */
     struct cake_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    u64 slice = tctx ? tctx->next_slice : quantum_ns;
+
+    /* Determine effective tier and slice.
+     *
+     * CAKE_FLOW_IRQ_WAKE: if the IRQ detection block in select_cpu stamped
+     * this flag, consume it here — we are taking the direct-dispatch path
+     * (SCX_DSQ_LOCAL_ON) so cake_enqueue will never run to consume it.
+     * Leaving it set would cause a stale T0 boost on the task's NEXT wakeup.
+     *
+     * When the flag is set: use T0 slice (CAKE's shortest, fastest-releasing
+     * quantum) so the IRQ-sourced task gets CPU time with minimal latency and
+     * vacates the core quickly. Use T0 stats bucket.
+     * When not set: use the pre-computed tier-adjusted next_slice as normal. */
+    u64 slice = quantum_ns;
+    u8 tier = CAKE_TIER_INTERACT;  /* default for unclassified tasks */
+
+    if (tctx) {
+        u32 sc_packed = cake_relaxed_load_u32(&tctx->packed_info);
+
+        if (unlikely(sc_packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
+            /* Consume the one-shot flag atomically */
+            __sync_fetch_and_and(&tctx->packed_info,
+                                 ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
+            /* T0 quantum (multiplier 0.25-0.5x) for fast core release */
+            u64 cfg = tier_configs[CAKE_TIER_CRITICAL & 7];
+            u64 mult = UNPACK_MULTIPLIER(cfg);
+            slice = (quantum_ns * mult) >> 10;
+            tier  = CAKE_TIER_CRITICAL;
+
+            if (enable_stats) {
+                struct cake_stats *s = get_local_stats();
+                if (s) s->nr_irq_wake_boosts++;
+            }
+        } else {
+            slice = tctx->next_slice;
+            tier  = GET_TIER(tctx) & 3;
+        }
+    }
 
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
 
-    /* FIX (#11): Count direct-dispatch stats so TUI reflects the common idle-path case.
-     * Previously only cake_enqueue counted dispatches, but on an idle gaming system
-     * nearly all dispatches bypass enqueue via SCX_DSQ_LOCAL_ON, making the TUI show
-     * near-zero counts. Gate on enable_stats to keep the hot path zero-overhead. */
+    /* FIX (#11): Count direct-dispatch stats so TUI reflects the common idle-path case. */
     if (enable_stats) {
         struct cake_stats *s = get_local_stats();
         if (s) {
             s->nr_new_flow_dispatches++;
-            u8 tier = tctx ? (GET_TIER(tctx) & 3) : CAKE_TIER_INTERACT;
             if (tier < CAKE_TIER_MAX)
                 s->nr_tier_dispatches[tier]++;
         }
@@ -335,6 +364,59 @@ s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags)
 s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
+    /* ── IRQ-SOURCE WAKEUP DETECTION (adapted from LAVD lavd_select_cpu) ──
+     * Detect whether the task is being woken from a hardirq, NMI, softirq
+     * bottom-half, or a ksoftirqd kernel thread. Any of these represent
+     * completed hardware I/O whose consumer should run at T0 immediately
+     * rather than waiting for EWMA settling.
+     *
+     * Gaming relevance:
+     *   hardirq:    mouse click, GPU V-sync, audio DMA completion
+     *   softirq:    network packet (online game), timer (frame cadence)
+     *   ksoftirqd:  deferred bottom-half for the above when load is high
+     *
+     * bpf_in_hardirq/nmi/serving_softirq() are x86 and arm64 only; on
+     * unsupported architectures they always return 0 (correct no-op).
+     *
+     * NOTE: ksoftirqd IS NOT covered by bpf_in_serving_softirq(). That
+     * helper is true only during actual softirq vector execution. ksoftirqd
+     * is a kernel thread that runs softirqs from process context, so its
+     * wakeups appear as normal SCX_WAKE_SYNC or non-sync kthread wakeups.
+     * We check it independently via comm prefix, matching LAVD's
+     * is_ksoftirqd() which uses the same __builtin_memcmp approach. */
+    struct cake_task_ctx *irq_tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (irq_tctx) {
+        bool set_irq_wake = false;
+
+        if (unlikely((bpf_in_hardirq() || bpf_in_nmi()) &&
+                     !bpf_in_serving_softirq())) {
+            /* Hard IRQ or NMI wakeup — highest urgency */
+            set_irq_wake = true;
+        } else if (unlikely(bpf_in_serving_softirq())) {
+            /* Softirq bottom-half wakeup */
+            set_irq_wake = true;
+        } else {
+            /* Check whether the waker is a ksoftirqd thread.
+             * Unlike the IRQ context checks above, this can occur on any
+             * wakeup type (SYNC or not), so we check it here independently.
+             *
+             * p is a trusted BTF pointer in STRUCT_OPS context — we can
+             * read waker->comm directly via __builtin_memcmp without going
+             * through bpf_probe_read_kernel (which would add unnecessary
+             * overhead and a potential failure path). This is the same
+             * technique used by LAVD's is_ksoftirqd(). */
+            struct task_struct *waker = bpf_get_current_task_btf();
+            if (waker && (waker->flags & PF_KTHREAD) &&
+                __builtin_memcmp(waker->comm, "ksoftirqd/", 10) == 0) {
+                set_irq_wake = true;
+            }
+        }
+
+        if (unlikely(set_irq_wake))
+            __sync_fetch_and_or(&irq_tctx->packed_info,
+                                (u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS);
+    }
+
     /* SYNC FAST PATH: Direct dispatch to waker's CPU.
      * Cold helper checks cpumask internally (Rule 5: zero extra hot-path
      * instructions). Returns -1 if cpumask disallows → fall through. */
@@ -350,11 +432,31 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 
     if (scr->dummy_idle) {
         /* Kernel found & claimed an idle CPU — direct dispatch.
-         * Use tier-adjusted slice so kernel preemption matches tick's check.
-         * Falls back to raw quantum for unclassified tasks (first wakeup).
-         * No tunnel needed — enqueue never runs on this path. */
+         * cake_enqueue will NOT run on this path, so we must consume
+         * CAKE_FLOW_IRQ_WAKE here if set — same as dispatch_sync_cold.
+         * Use tier-adjusted slice so kernel preemption matches tick's check. */
         struct cake_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-        u64 slice = tctx ? tctx->next_slice : quantum_ns;
+        u64 slice = quantum_ns;
+        u8  tier  = CAKE_TIER_INTERACT;
+
+        if (tctx) {
+            u32 idle_packed = cake_relaxed_load_u32(&tctx->packed_info);
+            if (unlikely(idle_packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
+                __sync_fetch_and_and(&tctx->packed_info,
+                                     ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
+                u64 cfg = tier_configs[CAKE_TIER_CRITICAL & 7];
+                slice = (quantum_ns * UNPACK_MULTIPLIER(cfg)) >> 10;
+                tier  = CAKE_TIER_CRITICAL;
+                if (enable_stats) {
+                    struct cake_stats *s = get_local_stats();
+                    if (s) s->nr_irq_wake_boosts++;
+                }
+            } else {
+                slice = tctx->next_slice;
+                tier  = GET_TIER(tctx) & 3;
+            }
+        }
+
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
 
         /* FIX (#11): Count idle-path direct dispatches for accurate TUI stats. */
@@ -362,7 +464,6 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
             struct cake_stats *s = get_local_stats();
             if (s) {
                 s->nr_new_flow_dispatches++;
-                u8 tier = tctx ? (GET_TIER(tctx) & 3) : CAKE_TIER_INTERACT;
                 if (tier < CAKE_TIER_MAX)
                     s->nr_tier_dispatches[tier]++;
             }
@@ -447,18 +548,99 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     u8 tier = GET_TIER(tctx_reg) & 3;
     u64 slice = tctx_reg->next_slice;
 
+    /* Load packed_info once — shared by all three feature checks below. */
+    u32 task_packed = cake_relaxed_load_u32(&tctx_reg->packed_info);
+
+    /* ── FEATURE 1: IRQ-SOURCE TIER OVERRIDE (adapted from LAVD) ──────────
+     * If cake_select_cpu stamped CAKE_FLOW_IRQ_WAKE, this task was woken
+     * directly from a hardware interrupt or softirq bottom-half. It should
+     * run at T0 for this dispatch regardless of its current EWMA tier, for
+     * the same reason LAVD applies LAVD_LC_WEIGHT_BOOST_HIGHEST: the
+     * interrupt represents completed hardware I/O and the woken task is the
+     * direct consumer (mouse handler, audio callback, network receive).
+     *
+     * Semantics: one-shot — the flag is cleared atomically here so it cannot
+     * accumulate across bounces or affect the EWMA classification path.
+     * This does NOT permanently alter the task's tier; reclassify_task_cold
+     * continues to govern long-term placement via avg_runtime_us. */
+    if (unlikely(task_packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
+        /* Consume the flag atomically before branching — prevents double-boost
+         * if select_cpu and enqueue race on a re-enqueue path. */
+        __sync_fetch_and_and(&tctx_reg->packed_info,
+                             ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
+        task_packed &= ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS);
+        tier = CAKE_TIER_CRITICAL;  /* T0 for this dispatch only */
+
+        if (enable_stats) {
+            struct cake_stats *s = get_local_stats();
+            if (s) s->nr_irq_wake_boosts++;
+        }
+    }
+
+    /* ── FEATURE 2: WAKER TIER INHERITANCE (adapted from LAVD) ─────────────
+     * LAVD propagates latency criticality through task graphs via
+     * lat_cri_waker/lat_cri_wakee fields. CAKE's simpler equivalent: when
+     * a high-priority task wakes a lower-priority task, temporarily promote
+     * the wakee to at most (waker_tier + 1).
+     *
+     * Rationale for gaming: a T0 input handler wakes the game's event
+     * dispatcher (T2) — without promotion, the event dispatcher sits in
+     * the T2 queue for up to 40ms. With promotion it runs in the T1 queue
+     * for this dispatch, and its EWMA will naturally converge to T1 within
+     * a few bouts if the pattern is consistent.
+     *
+     * Cost: one BSS L1 read (mega_mailbox[enq_cpu].flags, already in L1
+     * from any recent cake_tick on this CPU) + one comparison + one branch.
+     * ~4 cycles on an uncontested cacheline; zero if waker_tier >= tier.
+     *
+     * Constraints:
+     *   - Only on SCX_ENQ_WAKEUP (producer→consumer, not preempt or yield).
+     *   - Never promotes above CAKE_TIER_CRITICAL (floor is 0).
+     *   - Never demotes: if the wakee is already T0, this is a no-op.
+     *   - One-dispatch only: does not alter packed_info, so EWMA is unaffected.
+     *   - Only when tick_counter > 0: mega_mailbox flags are zero-initialized
+     *     (BSS). If no tick has fired on the waker's CPU yet, waker_tier would
+     *     read 0 (CRITICAL) spuriously, promoting every T2/T3 wakee on first
+     *     boot. tick_counter is incremented on the very first tick, making
+     *     it a reliable "mailbox is valid" sentinel.
+     *
+     * NOTE: enq_cpu is the waker's CPU — the same CPU that ran select_cpu
+     * and is now running enqueue. mega_mailbox[enq_cpu].flags contains the
+     * tier of the last task that ran on this CPU, set by cake_tick. */
+    if ((enq_flags & SCX_ENQ_WAKEUP) && tier > CAKE_TIER_CRITICAL) {
+        struct mega_mailbox_entry *waker_mbox = &mega_mailbox[enq_cpu];
+        /* Guard: only inherit when the waker's CPU has had at least one tick */
+        if (waker_mbox->tick_counter > 0) {
+            u8 waker_tier = MBOX_GET_TIER(waker_mbox->flags);
+            if (waker_tier < tier) {
+                /* Promote to at most one tier above waker, never below CRITICAL. */
+                u8 promoted = (waker_tier < CAKE_TIER_BULK) ? waker_tier + 1
+                                                             : waker_tier;
+                if (promoted < tier) {
+                    tier = promoted;
+                    if (enable_stats) {
+                        struct cake_stats *s = get_local_stats();
+                        if (s) s->nr_waker_tier_boosts++;
+                    }
+                }
+            }
+        }
+    }
+
     if (enable_stats) {
         struct cake_stats *s = get_local_stats();
-        if (enq_flags & SCX_ENQ_WAKEUP)
-            s->nr_new_flow_dispatches++;
-        else
-            s->nr_old_flow_dispatches++;
-
-        if (tier < CAKE_TIER_MAX)
-            s->nr_tier_dispatches[tier]++;
+        if (s) {
+            if (enq_flags & SCX_ENQ_WAKEUP)
+                s->nr_new_flow_dispatches++;
+            else
+                s->nr_old_flow_dispatches++;
+            if (tier < CAKE_TIER_MAX)
+                s->nr_tier_dispatches[tier]++;
+        }
     }
 
     /* A+B: Vtime-encoded priority: (tier << 56) | timestamp
+     *
      * DRR++ NEW FLOW BONUS: Tasks with CAKE_FLOW_NEW get a vtime reduction,
      * making them drain before established same-tier tasks. This gives
      * newly spawned threads instant responsiveness (e.g., game launching a
@@ -468,11 +650,35 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      * bits at [63:56]. If now_cached is small (early boot or timer wrap) and
      * new_flow_bonus_ns is large (8ms), the raw subtraction wraps the u64
      * into the tier field, silently misclassifying the task. Use saturating
-     * arithmetic on the timestamp portion only. */
+     * arithmetic on the timestamp portion only.
+     *
+     * ── FEATURE 3: LOCK HOLDER VTIME ADVANCE (adapted from LAVD) ──────────
+     * If this task currently holds a futex (set by lock_bpf.c fexit probes),
+     * advance its virtual timestamp within the tier by subtracting
+     * lock_holder_advance_ns. This sorts it ahead of same-tier peers without
+     * changing its tier, so it runs sooner and releases the lock faster,
+     * unblocking any waiter (which may be a T0 audio or input thread).
+     *
+     * Why within-tier rather than tier promotion?
+     *   Promoting a T3 bulk task that happens to hold a lock to T0 would
+     *   preempt audio and input threads. A within-tier advance is precise:
+     *   the holder races only against other same-tier tasks.
+     *
+     * Magnitude: new_flow_bonus_ns (8ms) is a natural sentinel — it is
+     * the largest advance already in the system (DRR++ new-flow bonus), so
+     * using the same value keeps the relative ordering consistent and avoids
+     * introducing a new tuning parameter. */
     u64 ts = now_cached & 0x00FFFFFFFFFFFFFFULL;
-    u32 task_packed = cake_relaxed_load_u32(&tctx_reg->packed_info);
     if (task_packed & ((u32)CAKE_FLOW_NEW << SHIFT_FLAGS))
         ts = (ts > new_flow_bonus_ns) ? (ts - new_flow_bonus_ns) : 0;
+
+    /* Lock-holder advance: sort ahead of same-tier non-holders. Applied after
+     * new-flow bonus so both effects compound (a new flow that also holds a
+     * lock sorts to the very front of its tier). Saturating to preserve tier
+     * bits — same FIX (#2) guard. */
+    if (unlikely(task_packed & ((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS)))
+        ts = (ts > new_flow_bonus_ns) ? (ts - new_flow_bonus_ns) : 0;
+
     u64 vtime = ((u64)tier << 56) | ts;
 
     scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, slice, vtime, enq_flags);
@@ -577,6 +783,39 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 
             u64 threshold = UNPACK_STARVATION_NS(tier_configs[tier_reg & 7]);
             if (unlikely(runtime > threshold)) {
+                /* ── FEATURE 3: LOCK HOLDER STARVATION SKIP (adapted from LAVD) ──
+                 * LAVD's can_x_kick_cpu2() explicitly refuses to preempt a CPU
+                 * running a lock holder (is_lock_holder_running()). We apply the
+                 * same principle here: if the running task holds a futex, skip the
+                 * starvation preemption.
+                 *
+                 * Rationale: preempting a lock holder causes priority inversion —
+                 * any task waiting on the lock is blocked until the holder is
+                 * rescheduled AND releases it. For gaming this matters because:
+                 *   - Wine/Proton hold D3D command-list mutexes across full frames
+                 *   - Audio callbacks hold mixing locks at T0 priority
+                 *   - The waiting task (T0/T1) is blocked longer than if we had
+                 *     simply let the holder (T2/T3) finish its critical section.
+                 *
+                 * Safety: the starvation threshold still applies on the *next* tick
+                 * after the lock is released (CAKE_FLAG_LOCK_HOLDER is cleared by the
+                 * fexit probe). We do NOT skip the slice check above (runtime >
+                 * next_slice), which remains an unconditional hard ceiling. Lock
+                 * holders that run indefinitely still get preempted at slice expiry.
+                 *
+                 * Cost: one relaxed atomic read of packed_info (already in L1 from
+                 * PHASE 1) + one AND + one branch-not-taken. ~2 cycles on the common
+                 * path (not a lock holder). */
+                u32 tick_packed = cake_relaxed_load_u32(&tctx_reg->packed_info);
+                if (unlikely(tick_packed & ((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS))) {
+                    /* Skip preempt — let the lock holder finish the critical section */
+                    if (enable_stats) {
+                        struct cake_stats *s = get_local_stats();
+                        if (s) s->nr_lock_holder_skips++;
+                    }
+                    goto mailbox_dvfs;  /* Still update mailbox and DVFS */
+                }
+
                 scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
 
                 if (enable_stats && tier_reg < CAKE_TIER_MAX) {
@@ -593,6 +832,8 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
         /* Skipped check — still increment counter for next mask eval */
         if (tc < 255) mbox->tick_counter = tc + 1;
     }
+
+mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6.8.1) */
 
     /* MEGA-MAILBOX UPDATE: tier for dispatch to consume (MESI-guarded) */
     u8 new_flags = (tier_reg & MBOX_TIER_MASK);
