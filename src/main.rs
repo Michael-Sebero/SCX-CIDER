@@ -324,7 +324,12 @@ impl<'a> Scheduler<'a> {
         // Detect system topology (CCDs, P/E cores)
         let topo = topology::detect()?;
 
-        // Get effective values (profile + CLI overrides)
+        // Get effective values (profile + CLI overrides).
+        // Note: the starvation component (_) is intentionally discarded here.
+        // tier_configs() receives args.starvation as a raw Option<u64> so it
+        // can apply proportional per-tier scaling internally.  The merged
+        // starvation value from effective_values() is only used for display
+        // in show_startup_splash().
         let (quantum, new_flow_bonus, _) = args.effective_values();
 
         // ETD: Empirical Topology Discovery — run in background so the scheduler

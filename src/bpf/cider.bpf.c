@@ -843,11 +843,11 @@ void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
     }
 
     for (u32 i = 0; steal_mask && i < nr_llcs; i++) {
-        /* FIX (#15): steal_mask is u32 — use BIT_SCAN_FORWARD_U32. */
+        /* i is a verifier-required trip-count bound; actual iteration is BSF-driven.
+         * steal_mask bits are set only for indices in [0, nr_llcs) by the loop above,
+         * so victim is always a valid LLC index — no bounds check needed. */
         u32 victim = BIT_SCAN_FORWARD_U32(steal_mask);
         steal_mask &= steal_mask - 1;  /* clear LSB */
-        if (victim >= nr_llcs)
-            continue;
         if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + victim))
             return;
         /* Victim was empty despite flag being set — clear stale entry */
@@ -902,17 +902,12 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
      *   counter < 32: check every 4th tick (confident, max 3ms delay)
      *   counter >= 32: check every 8th tick (high confidence, max 7ms delay)
      *
-     * FIX (audit): Contention previously reset tick_counter to 0, which causes
-     * permanent low-confidence on workloads that oscillate between 1 and 2
-     * runnable tasks (the common gaming pattern: game thread + background shader
-     * compiler).  With a hard reset, tc never climbs above 8, defeating the
-     * backoff entirely and running the rq-read path on every tick.
-     *
-     * New policy: halve tc on contention (tc >>= 1).  A single contention
-     * event at tc=32 drops to tc=16 (every-2nd-tick zone), not all the way to
-     * zero.  The counter recovers to tc=32 in ~16 ticks (~16ms), significantly
-     * reducing overhead on lightly contended CPUs while staying maximally
-     * alert during sustained contention (where tc stays low by design). */
+     * On contention, tc is decayed by 25% (tc -= tc >> 2) rather than reset
+     * to 0.  A hard reset caused permanent low-confidence on workloads that
+     * oscillate between 1 and 2 runnable tasks (game thread + background shader
+     * compiler), defeating the backoff entirely.  At tc=32 a contention event
+     * yields tc=24 (still in the every-4th-tick zone); the counter recovers to
+     * tc=32 in ~8 ticks (~8ms) under oscillating contention. */
     struct mega_mailbox_entry *mbox = &mega_mailbox[cpu_id_reg];
     u8 tc = cider_relaxed_load_u8(&mbox->tick_counter);
     u8 skip_mask = tc < 8 ? 0 : tc < 16 ? 1 : tc < 32 ? 3 : 7;
@@ -920,20 +915,10 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
     if (!(tc & skip_mask)) {
         struct rq *rq = cider_get_rq(cpu_id_reg);
         if (rq && rq->scx.nr_running > 1) {
-            /* Contention detected — quarter-decay confidence (subtract 25%, not halve).
-             *
-             * FIX (audit): Previous halving (tc >>= 1) was too aggressive for
-             * the common gaming pattern of oscillating between 1 and 2 runnable
-             * tasks (game thread + background shader compiler).  At tc=32 a single
-             * contention event dropped to tc=16 (every-2nd-tick zone), and with
-             * contention alternating every few ticks tc never recovered past 16,
-             * running the rq-read path on every other tick.
-             *
-             * New policy: tc -= tc >> 2 (subtract 25%).  At tc=32 a contention event
-             * yields tc=24 (still in the every-4th-tick zone), and the counter
-             * recovers to tc=32 in ~8 ticks (~8ms) instead of ~16.  Under sustained
-             * contention (tc stays low by design) the difference is negligible;
-             * under oscillating contention overhead is roughly halved. */
+            /* Contention detected — quarter-decay confidence (tc -= tc >> 2).
+             * Subtracting 25% keeps tc in the same skip-mask zone after a
+             * single event (tc=32 → tc=24, still every-4th-tick), recovering
+             * to tc=32 in ~8 ticks (~8ms) under oscillating contention. */
             cider_relaxed_store_u8(&mbox->tick_counter, tc - (tc >> 2));
 
             u64 threshold = UNPACK_STARVATION_NS(tier_configs[CAKE_TIER_IDX(tier_reg)]);
