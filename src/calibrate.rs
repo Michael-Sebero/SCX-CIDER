@@ -27,6 +27,11 @@ impl PaddedAtomicBool {
 struct SharedState {
     barrier: Barrier,
     flag: PaddedAtomicBool,
+    // FIX (deadlock): abort signals that one thread failed affinity pinning.
+    // Both threads store true before barrier.wait() on failure; both check
+    // after barrier.wait() and exit cleanly.  Without this, the failing thread
+    // returned before barrier.wait(), permanently blocking the other thread.
+    abort: AtomicBool,
 }
 
 const PING: bool = false;
@@ -86,6 +91,7 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
     let state = Arc::new(SharedState {
         barrier: Barrier::new(2),
         flag: PaddedAtomicBool::new(PING),
+        abort: AtomicBool::new(false),
     });
 
     let clock = Arc::new(Clock::new());
@@ -101,14 +107,25 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
         // PONG thread: waits for PING, sets to PONG
         let pong = s.spawn(move |_| {
             let core_id = core_affinity::CoreId { id: cpu_b };
+
+            // FIX (deadlock): Signal abort BEFORE barrier.wait() so the ping
+            // thread is never permanently blocked waiting for a pong that exited.
+            // Previously: affinity check → early return (before barrier) → ping
+            // blocks at barrier.wait() forever.
             if !core_affinity::set_for_current(core_id) {
+                state_pong.abort.store(true, Ordering::Release);
+            }
+
+            // Unconditional barrier participation — both threads must reach this.
+            state_pong.barrier.wait();
+
+            // If either side failed, bail out cleanly.
+            if state_pong.abort.load(Ordering::Acquire) {
                 return;
             }
 
             // FIX (#13): Warn on RT priority failure instead of silently ignoring
             try_set_realtime_priority();
-
-            state_pong.barrier.wait();
 
             // Warmup phase (not timed, stabilizes boost clocks)
             for _ in 0..warmup_trips {
@@ -140,7 +157,19 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
         // PING thread: sets to PING, waits for PONG, measures time
         let ping = s.spawn(move |_| {
             let core_id = core_affinity::CoreId { id: cpu_a };
+
+            // FIX (deadlock): Signal abort BEFORE barrier.wait() so the pong
+            // thread is never permanently blocked if ping's affinity fails.
             if !core_affinity::set_for_current(core_id) {
+                state_ping.abort.store(true, Ordering::Release);
+            }
+
+            // Unconditional barrier participation — both threads must reach this.
+            state_ping.barrier.wait();
+
+            // If either side failed (checked after barrier so both see the flag),
+            // bail out without entering the measurement loops.
+            if state_ping.abort.load(Ordering::Acquire) {
                 return None;
             }
 
@@ -148,8 +177,6 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
             try_set_realtime_priority();
 
             let mut results = Vec::with_capacity(num_samples);
-
-            state_ping.barrier.wait();
 
             // Warmup phase (not timed, stabilizes boost clocks)
             for _ in 0..warmup_trips {

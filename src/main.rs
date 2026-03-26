@@ -52,8 +52,10 @@ impl Profile {
             Profile::Legacy => (4000, 12000, 200000),
             // Gaming: Aggressive latency, 2ms quantum
             Profile::Gaming => (2000, 8000, 100000),
-            // Default: Same as gaming for now
-            Profile::Default => (2000, 8000, 100000),
+            // FIX (explicit delegation): Default explicitly delegates to Gaming rather
+            // than duplicating the same literals.  When Gaming values are updated,
+            // Default automatically tracks them — no risk of the two diverging silently.
+            Profile::Default => Profile::Gaming.values(),
         }
     }
 
@@ -77,6 +79,8 @@ impl Profile {
                 200_000_000,
                 200_000_000, // Padding
             ],
+            // FIX (explicit delegation): Default delegates to Gaming so values
+            // stay in sync without duplication.
             Profile::Gaming | Profile::Default => [
                 3_000_000,   // T0 Critical: 3ms
                 8_000_000,   // T1 Interactive: 8ms
@@ -100,6 +104,7 @@ impl Profile {
                 4095, // T3 Bulk: ~4x = 4ms
                 4095, 4095, 4095, 4095,
             ],
+            // FIX (explicit delegation): Default delegates to Gaming.
             Profile::Gaming | Profile::Default => [
                 512,  // T0 Critical: 0.5x = 1ms — releases cores to game threads quickly
                 1024, // T1 Interactive: 1.0x = 2ms
@@ -134,6 +139,7 @@ impl Profile {
                 0,          // T3 Bulk: no limit
                 0, 0, 0, 0, // Padding
             ],
+            // FIX (explicit delegation): Default delegates to Gaming.
             Profile::Gaming | Profile::Default => [
                 100_000,   // T0 Critical: 100µs
                 2_000_000, // T1 Interactive: 2ms

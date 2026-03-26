@@ -328,6 +328,42 @@ static __always_inline struct cider_task_ctx *get_task_ctx(struct task_struct *p
  * - Zero stale mask cascades (kernel idle bitmap is real-time)
  * - ~90-110 cycles vs ~200-500 cycles (~20-40ns p50 improvement)
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* ── SHARED HELPER: IRQ-wake flag consumption ───────────────────────────────
+ * Centralises the CAKE_FLOW_IRQ_WAKE one-shot flag consumption that previously
+ * appeared identically in both dispatch_sync_cold and the dummy_idle branch of
+ * cider_select_cpu.  Keeping two copies risked them drifting apart silently.
+ *
+ * Consumes the flag atomically if set, writes the T0 slice to *slice_out, and
+ * returns CAKE_TIER_CRITICAL.  If not set, passes through next_slice and the
+ * task's current tier.  If tctx is NULL (task not yet classified), defaults to
+ * quantum_ns + CAKE_TIER_INTERACT — safe for unclassified tasks on idle CPUs.
+ *
+ * Called only from direct-dispatch paths (SCX_DSQ_LOCAL_ON) where cider_enqueue
+ * will NOT run to consume the flag; leaving it set would cause a stale T0 boost
+ * on the task's next wakeup. */
+static __always_inline u8
+consume_irq_wake_get_tier_slice(struct cider_task_ctx *tctx, u64 *slice_out)
+{
+    if (tctx) {
+        u32 packed = cider_relaxed_load_u32(&tctx->packed_info);
+        if (unlikely(packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
+            __sync_fetch_and_and(&tctx->packed_info,
+                                 ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
+            u64 cfg = tier_configs[CAKE_TIER_IDX(CAKE_TIER_CRITICAL)];
+            *slice_out = (quantum_ns * UNPACK_MULTIPLIER(cfg)) >> 10;
+            if (enable_stats) {
+                struct cider_stats *s = get_local_stats();
+                if (s) s->nr_irq_wake_boosts++;
+            }
+            return CAKE_TIER_CRITICAL;
+        }
+        *slice_out = tctx->next_slice;
+        return CAKE_TIER_IDX(GET_TIER(tctx));
+    }
+    *slice_out = quantum_ns;
+    return CAKE_TIER_INTERACT;
+}
+
 /* SYNC fast-path dispatch: waker's CPU is by definition running.
  * Noinline: only 2 args (p, wake_flags) → r1→r6, r2→r7 saves
  * leave r8,r9 free. Single kfunc call (get_smp_id) + dispatch.
@@ -348,42 +384,11 @@ s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags)
 
     struct cider_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
 
-    /* Determine effective tier and slice.
-     *
-     * CAKE_FLOW_IRQ_WAKE: if the IRQ detection block in select_cpu stamped
-     * this flag, consume it here — we are taking the direct-dispatch path
-     * (SCX_DSQ_LOCAL_ON) so cider_enqueue will never run to consume it.
-     * Leaving it set would cause a stale T0 boost on the task's NEXT wakeup.
-     *
-     * When the flag is set: use T0 slice (CAKE's shortest, fastest-releasing
-     * quantum) so the IRQ-sourced task gets CPU time with minimal latency and
-     * vacates the core quickly. Use T0 stats bucket.
-     * When not set: use the pre-computed tier-adjusted next_slice as normal. */
-    u64 slice = quantum_ns;
-    u8 tier = CAKE_TIER_INTERACT;  /* default for unclassified tasks */
-
-    if (tctx) {
-        u32 sc_packed = cider_relaxed_load_u32(&tctx->packed_info);
-
-        if (unlikely(sc_packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
-            /* Consume the one-shot flag atomically */
-            __sync_fetch_and_and(&tctx->packed_info,
-                                 ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
-            /* T0 quantum (multiplier 0.25-0.5x) for fast core release */
-            u64 cfg = tier_configs[CAKE_TIER_CRITICAL & 7];
-            u64 mult = UNPACK_MULTIPLIER(cfg);
-            slice = (quantum_ns * mult) >> 10;
-            tier  = CAKE_TIER_CRITICAL;
-
-            if (enable_stats) {
-                struct cider_stats *s = get_local_stats();
-                if (s) s->nr_irq_wake_boosts++;
-            }
-        } else {
-            slice = tctx->next_slice;
-            tier  = GET_TIER(tctx) & 3;
-        }
-    }
+    /* Determine effective tier and slice via shared helper.
+     * consume_irq_wake_get_tier_slice() handles the CAKE_FLOW_IRQ_WAKE one-shot
+     * flag, T0 slice computation, stats accounting, and NULL-tctx fallback. */
+    u64 slice;
+    u8 tier = consume_irq_wake_get_tier_slice(tctx, &slice);
 
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
 
@@ -475,26 +480,10 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
          * CAKE_FLOW_IRQ_WAKE here if set — same as dispatch_sync_cold.
          * Use tier-adjusted slice so kernel preemption matches tick's check. */
         struct cider_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-        u64 slice = quantum_ns;
-        u8  tier  = CAKE_TIER_INTERACT;
 
-        if (tctx) {
-            u32 idle_packed = cider_relaxed_load_u32(&tctx->packed_info);
-            if (unlikely(idle_packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
-                __sync_fetch_and_and(&tctx->packed_info,
-                                     ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
-                u64 cfg = tier_configs[CAKE_TIER_CRITICAL & 7];
-                slice = (quantum_ns * UNPACK_MULTIPLIER(cfg)) >> 10;
-                tier  = CAKE_TIER_CRITICAL;
-                if (enable_stats) {
-                    struct cider_stats *s = get_local_stats();
-                    if (s) s->nr_irq_wake_boosts++;
-                }
-            } else {
-                slice = tctx->next_slice;
-                tier  = GET_TIER(tctx) & 3;
-            }
-        }
+        /* Shared helper handles flag consumption, stats, and NULL-tctx fallback. */
+        u64 slice;
+        u8  tier = consume_irq_wake_get_tier_slice(tctx, &slice);
 
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
 
@@ -568,7 +557,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
      * latency-sensitive tasks remain properly prioritized even when yielding.
      * Tasks with no context yet fall back to T3 (yield implies they're not urgent). */
     if (!(enq_flags & (SCX_ENQ_WAKEUP | SCX_ENQ_PREEMPT))) {
-        u8 yield_tier = tctx_reg ? (GET_TIER(tctx_reg) & 3) : CAKE_TIER_BULK;
+        u8 yield_tier = tctx_reg ? CAKE_TIER_IDX(GET_TIER(tctx_reg)) : CAKE_TIER_BULK;
         u64 vtime = ((u64)yield_tier << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
         llc_mark_nonempty(enq_llc);
@@ -584,7 +573,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     /* Standard Tier Logic */
-    u8 tier = GET_TIER(tctx_reg) & 3;
+    u8 tier = CAKE_TIER_IDX(GET_TIER(tctx_reg));
     u64 slice = tctx_reg->next_slice;
 
     /* Load packed_info once — shared by all three feature checks below. */
@@ -857,7 +846,7 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
             /* Contention detected — soft-decay confidence (halve, not reset) */
             cider_relaxed_store_u8(&mbox->tick_counter, tc >> 1);
 
-            u64 threshold = UNPACK_STARVATION_NS(tier_configs[tier_reg & 7]);
+            u64 threshold = UNPACK_STARVATION_NS(tier_configs[CAKE_TIER_IDX(tier_reg)]);
             if (unlikely(runtime > threshold)) {
                 /* ── FEATURE 3: LOCK HOLDER STARVATION SKIP (adapted from LAVD) ──
                  * LAVD's can_x_kick_cpu2() explicitly refuses to preempt a CPU
@@ -933,7 +922,7 @@ mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6
      * Hybrid scaling: on Intel P/E-core systems, scale target by each core's
      * cpuperf_cap so E-cores don't get over-requested. JIT eliminates this
      * branch entirely on non-hybrid CPUs (has_hybrid = false in RODATA). */
-    u32 target = tier_perf_target[tier_reg & 7];
+    u32 target = tier_perf_target[CAKE_TIER_IDX(tier_reg)];
     if (has_hybrid) {
         u32 cap = scx_bpf_cpuperf_cap(cpu_id_reg);
         target = (target * cap) >> 10;  /* scale by capability (1024 = 100%) */
@@ -991,6 +980,38 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
         return;  /* Never ran — skip (safety gate) */
 
     u32 runtime_raw = now - last_run;
+
+    /* FIX (post-load recovery): If the task has been sleeping for over 500ms
+     * (e.g. a loading screen, an idle background service resuming), pull its
+     * avg_runtime_us halfway toward the midpoint of its current tier before
+     * running the EWMA.  Without this, a game thread that spends 30s at T3
+     * during asset loading needs 10+ EWMA bouts (20–32ms) to recover to T1/T2
+     * after the load completes — during which game frames compete at the wrong
+     * tier, causing frame-time spikes at session start.
+     *
+     * 500ms threshold is deliberately above any gaming frame cadence (even at
+     * 24fps the frame period is ~42ms) but below OS idle timers, so only genuine
+     * sleeps trigger the decay.  We write the corrected value back immediately so
+     * both the fast-backoff path and the full reclassify path below read the
+     * decayed base.  Single-step: halve the distance to the tier midpoint — the
+     * EWMA then converges to the true runtime within 3–5 bouts instead of 10+.
+     *
+     * Tier midpoints (geometric mean of adjacent gates):
+     *   T0 Critical  (<100µs):   ~50µs
+     *   T1 Interact  (<2000µs):  ~1050µs
+     *   T2 Frame     (<8000µs):  ~5000µs
+     *   T3 Bulk      (≥8000µs):  floor = 8001µs */
+    if (runtime_raw > 500000000U) {
+        static const u16 tier_sleep_mid[4] = { 50, 1050, 5000, 8001 };
+        u8 s_tier = (packed >> SHIFT_TIER) & MASK_TIER;
+        u32 cur_fused = tctx->deficit_avg_fused;
+        u16 cur_avg   = EXTRACT_AVG_RT(cur_fused);
+        u16 mid       = tier_sleep_mid[CAKE_TIER_IDX(s_tier)];
+        /* Halve the distance: one step toward midpoint, preserving EWMA direction */
+        tctx->deficit_avg_fused = PACK_DEFICIT_AVG(EXTRACT_DEFICIT(cur_fused),
+                                                   (u16)((cur_avg + mid) >> 1));
+    }
+
     u32 runtime_us = runtime_raw >> 10;  /* ns → ~μs (÷1024 ≈ ÷1000) */
 
     /* Clamp to u16 max for EWMA field (65ms max, more than any reasonable burst) */
@@ -1028,10 +1049,9 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
 
         /* Per-tier recheck: increment counter, check against tier mask */
         u8 tier = (packed >> SHIFT_TIER) & MASK_TIER;
-        /* FIX (audit): Use & 7 to match all other tier array accesses.
-         * & 3 was semantically correct (tier is 2-bit) but inconsistent
-         * with tier_configs[] and tier_perf_target[] which use & 7. */
-        u16 mask = tier_recheck_mask[tier & 7];
+        /* FIX (audit): Use CAKE_TIER_IDX() for all tier array accesses — canonical
+         * bounds-check that matches the compile-time assert in intf.h. */
+        u16 mask = tier_recheck_mask[CAKE_TIER_IDX(tier)];
         u16 counter = tctx->reclass_counter + 1;
         tctx->reclass_counter = counter;
         if (counter & mask) {
@@ -1140,7 +1160,7 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
     /* When tier changes, the quantum multiplier changes (T0=0.75x → T3=1.4x).
      * Update next_slice so the next execution bout uses the correct quantum. */
     if (tier_changed) {
-        u64 cfg = tier_configs[new_tier & 7];
+        u64 cfg = tier_configs[CAKE_TIER_IDX(new_tier)];
         u64 mult = UNPACK_MULTIPLIER(cfg);
         tctx->next_slice = (quantum_ns * mult) >> 10;
         tctx->reclass_counter = 0;
@@ -1203,7 +1223,7 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
     cider_relaxed_store_u32(&ctctx->packed_info, cpacked);
 
     /* Pre-compute slice for inherited tier so first dispatch uses correct quantum */
-    u64 cfg  = tier_configs[ptier & 7];
+    u64 cfg  = tier_configs[CAKE_TIER_IDX(ptier)];
     u64 mult = UNPACK_MULTIPLIER(cfg);
     ctctx->next_slice = (quantum_ns * mult) >> 10;
 

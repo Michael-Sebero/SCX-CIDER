@@ -289,7 +289,12 @@ int cider_tp_exit_futex(struct tp_cider_futex_exit *ctx)
     case CAKE_FUTEX_WAKE:
     case CAKE_FUTEX_WAKE_BITSET:
     case CAKE_FUTEX_WAKE_OP:
-        if (ret > 0)
+        /* FIX (tracepoint/fexit alignment): use ret >= 0 to match the fexit
+         * path (cider_fexit_futex_wake uses ret >= 0).  The previous ret > 0
+         * left CAKE_FLAG_LOCK_HOLDER set when futex_wake succeeded but woke
+         * zero waiters (ret == 0), causing spurious starvation-skip on the
+         * next tick even though no lock is held. */
+        if (ret >= 0)
             clear_lock_holder();
         break;
 
@@ -331,7 +336,12 @@ int cider_tp_exit_futex_waitv(struct tp_cider_futex_exit *ctx)
 SEC("?tracepoint/syscalls/sys_exit_futex_wake")
 int cider_tp_exit_futex_wake(struct tp_cider_futex_exit *ctx)
 {
-    if (ctx->ret > 0)
+    /* FIX (tracepoint/fexit alignment): use ret >= 0 to match the fexit
+     * path (cider_fexit_futex_wake uses ret >= 0).  The previous ret > 0
+     * left CAKE_FLAG_LOCK_HOLDER set when futex_wake succeeded but woke
+     * zero waiters (ret == 0), causing spurious starvation-skip on the
+     * next tick even though no lock is held. */
+    if (ctx->ret >= 0)
         clear_lock_holder();
     return 0;
 }

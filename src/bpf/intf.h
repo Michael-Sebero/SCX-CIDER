@@ -33,6 +33,16 @@ enum cider_tier {
     CAKE_TIER_MAX       = 4,
 };
 
+/* FIX (consistency): Use CAKE_TIER_IDX() for all tier array bounds-checking.
+ * This replaces the mix of (tier & 3) and (tier & 7) at different call sites
+ * with a single canonical form.  The mask of 7 is correct because all tier
+ * arrays (tier_configs[], tier_perf_target[], tier_recheck_mask[]) are sized
+ * to 8 elements for safe access.  A _Static_assert below ensures CAKE_TIER_MAX
+ * never exceeds the array size. */
+#define CAKE_TIER_IDX(t)  ((t) & 7)
+_Static_assert(CAKE_TIER_MAX <= 8,
+    "CAKE_TIER_MAX exceeds array size — update CAKE_TIER_IDX mask");
+
 #define CAKE_MAX_CPUS 64
 #define CAKE_MAX_LLCS 8
 
