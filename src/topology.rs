@@ -31,11 +31,6 @@ pub struct TopologyInfo {
     pub cpu_is_big: [u8; MAX_CPUS],
     pub cpu_core_id: [u8; MAX_CPUS],
     pub cpu_thread_bit: [u8; MAX_CPUS],
-    // FIX (vestigial): cpu_dsq_id removed. The scheduler uses per-LLC DSQs
-    // (LLC_DSQ_BASE + llc_id) exclusively; per-CPU DSQ IDs were never registered
-    // in cider_init and referencing them would cause a BPF error. Removing the
-    // field prevents accidental use and reduces TopologyInfo by 256 bytes.
-    pub cpu_dsq_id: [u32; MAX_CPUS], // DEPRECATED: unused by BPF, kept for ABI stability only
     /// Pre-computed 64-bit mask of all CPUs in a physical core
     pub core_cpu_mask: [u64; 32],
     /// Bitmask requirement for a core to be "fully idle" (e.g. 0x3 for dual SMT)
@@ -86,7 +81,6 @@ pub fn detect() -> Result<TopologyInfo> {
         cpu_is_big: [1; MAX_CPUS], // Default to 1 (Big) to be safe
         cpu_core_id: [0; MAX_CPUS],
         cpu_thread_bit: [0; MAX_CPUS],
-        cpu_dsq_id: [0; MAX_CPUS], // DEPRECATED: not used by BPF scheduler
         core_cpu_mask: [0; 32],
         core_thread_mask: [0; 32],
         llc_cpu_mask: [0; MAX_LLCS],
@@ -169,9 +163,6 @@ pub fn detect() -> Result<TopologyInfo> {
                 info.cpu_is_big[cpu] = is_big;
                 info.cpu_core_id[cpu] = core_id as u8;
                 info.cpu_thread_bit[cpu] = 1 << thread_idx;
-                // cpu_dsq_id intentionally not set: per-CPU DSQs are never created
-                // by cider_init; only per-LLC DSQs (LLC_DSQ_BASE + llc_id) exist.
-
                 if core_id < 32 {
                     info.core_cpu_mask[core_id] |= 1u64 << cpu;
                 }

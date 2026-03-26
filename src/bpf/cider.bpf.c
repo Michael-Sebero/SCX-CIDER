@@ -365,24 +365,27 @@ consume_irq_wake_get_tier_slice(struct cider_task_ctx *tctx, u64 *slice_out)
 }
 
 /* SYNC fast-path dispatch: waker's CPU is by definition running.
- * Noinline: only 2 args (p, wake_flags) → r1→r6, r2→r7 saves
- * leave r8,r9 free. Single kfunc call (get_smp_id) + dispatch.
- * Splitting this out lets the main function avoid hoisting
- * bpf_get_smp_processor_id above the SYNC branch, which was the
- * root cause of Spill A (p had to survive across the shared call).
+ * Noinline: only 3 args (p, wake_flags, hint_tctx) — r1→r6, r2→r7, r3→r8.
+ * hint_tctx is the pointer already obtained by the IRQ-detection block at
+ * the top of cider_select_cpu; passing it here eliminates a second
+ * bpf_task_storage_get (~20c) on the SYNC path (the dominant gaming wakeup).
+ * hint_tctx may be NULL for unclassified tasks — consume_irq_wake_get_tier_slice
+ * handles that case with safe defaults.
  *
  * CPUMASK GUARD: Check inside cold path (Rule 5/13: no extra work on
  * inline hot path). Wine/Proton threadpools use sched_setaffinity —
  * waker's CPU may not be in woken task's cpumask. Returns -1 to signal
  * fallthrough to kernel path which handles cpumask correctly. */
 static __attribute__((noinline))
-s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags)
+s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags,
+                       struct cider_task_ctx *hint_tctx)
 {
     u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
     if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
         return -1;
 
-    struct cider_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    /* Use the tctx pointer already in hand — no second storage lookup needed. */
+    struct cider_task_ctx *tctx = hint_tctx;
 
     /* Determine effective tier and slice via shared helper.
      * consume_irq_wake_get_tier_slice() handles the CAKE_FLOW_IRQ_WAKE one-shot
@@ -462,10 +465,12 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /* SYNC FAST PATH: Direct dispatch to waker's CPU.
+     * Pass irq_tctx already obtained above — dispatch_sync_cold reuses it
+     * directly, saving one bpf_task_storage_get (~20c) on this hot path.
      * Cold helper checks cpumask internally (Rule 5: zero extra hot-path
      * instructions). Returns -1 if cpumask disallows → fall through. */
     if (wake_flags & SCX_WAKE_SYNC) {
-        s32 sync_cpu = dispatch_sync_cold(p, wake_flags);
+        s32 sync_cpu = dispatch_sync_cold(p, wake_flags, irq_tctx);
         if (sync_cpu >= 0)
             return sync_cpu;
     }
@@ -478,8 +483,9 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
         /* Kernel found & claimed an idle CPU — direct dispatch.
          * cider_enqueue will NOT run on this path, so we must consume
          * CAKE_FLOW_IRQ_WAKE here if set — same as dispatch_sync_cold.
-         * Use tier-adjusted slice so kernel preemption matches tick's check. */
-        struct cider_task_ctx *tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+         * Use tier-adjusted slice so kernel preemption matches tick's check.
+         * Reuse irq_tctx already obtained above — no third storage lookup. */
+        struct cider_task_ctx *tctx = irq_tctx;
 
         /* Shared helper handles flag consumption, stats, and NULL-tctx fallback. */
         u64 slice;
