@@ -252,42 +252,37 @@ where
             const MAX_RETRIES: u32 = 3;
 
             while let Some(samples) = measure_pair(cpu_a, cpu_b, config) {
-                if !samples.is_empty() {
-                    // Calculate mean and standard deviation
-                    let n = samples.len() as f64;
-                    let mean = samples.iter().sum::<f64>() / n;
-                    let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-                    let stddev = variance.sqrt();
+                let n = samples.len() as f64;
+                let mean = samples.iter().sum::<f64>() / n;
+                let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+                let stddev = variance.sqrt();
 
-                    // Check if variance is acceptable (no IRQ interference)
-                    if stddev <= config.max_stddev || retry_count >= MAX_RETRIES {
-                        // Use median for final value (more robust than mean)
-                        let mut sorted = samples;
-                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        let median = sorted[sorted.len() / 2];
+                // Check if variance is acceptable (no IRQ interference)
+                if stddev <= config.max_stddev || retry_count >= MAX_RETRIES {
+                    // Use median for final value (more robust than mean)
+                    let mut sorted = samples;
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let median = sorted[sorted.len() / 2];
 
-                        matrix[cpu_a][cpu_b] = median;
-                        matrix[cpu_b][cpu_a] = median;
+                    matrix[cpu_a][cpu_b] = median;
+                    matrix[cpu_b][cpu_a] = median;
 
-                        if stddev > config.max_stddev {
-                            debug!(
-                                "ETD: CPU {}<->{} stddev={:.1}ns (exceeded threshold after {} retries)",
-                                cpu_a, cpu_b, stddev, retry_count
-                            );
-                        }
-
-                        // Report progress (not complete yet)
-                        progress_callback(current_pair, total_pairs, false);
-                        break;
-                    } else {
-                        retry_count += 1;
+                    if stddev > config.max_stddev {
                         debug!(
-                            "ETD: CPU {}<->{} stddev={:.1}ns > {:.1}ns, retrying ({}/{})",
-                            cpu_a, cpu_b, stddev, config.max_stddev, retry_count, MAX_RETRIES
+                            "ETD: CPU {}<->{} stddev={:.1}ns (exceeded threshold after {} retries)",
+                            cpu_a, cpu_b, stddev, retry_count
                         );
                     }
+
+                    // Report progress (not complete yet)
+                    progress_callback(current_pair, total_pairs, false);
+                    break;
                 } else {
-                    break; // Empty samples, skip
+                    retry_count += 1;
+                    debug!(
+                        "ETD: CPU {}<->{} stddev={:.1}ns > {:.1}ns, retrying ({}/{})",
+                        cpu_a, cpu_b, stddev, config.max_stddev, retry_count, MAX_RETRIES
+                    );
                 }
             }
         }

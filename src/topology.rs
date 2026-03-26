@@ -78,7 +78,7 @@ pub fn detect() -> Result<TopologyInfo> {
         smt_enabled: topo.smt_enabled,
         cpu_sibling_map,
         cpu_llc_id: [0; MAX_CPUS],
-        cpu_is_big: [1; MAX_CPUS], // Default to 1 (Big) to be safe
+        cpu_is_big: [0; MAX_CPUS], // Reset and re-populated by P/E-core detection below
         cpu_core_id: [0; MAX_CPUS],
         cpu_thread_bit: [0; MAX_CPUS],
         core_cpu_mask: [0; 32],
@@ -123,9 +123,6 @@ pub fn detect() -> Result<TopologyInfo> {
     }
 
     // 2. Identify P-cores vs E-cores
-    // Reset defaults to recalculate based on CoreType
-    info.cpu_is_big = [0; MAX_CPUS];
-    info.big_cpu_mask = 0;
 
     let mut p_cores_found = 0;
     let mut e_cores_found = 0;
@@ -178,13 +175,6 @@ pub fn detect() -> Result<TopologyInfo> {
     // Update hybrid flag
     if p_cores_found > 0 && e_cores_found > 0 {
         info.has_hybrid_cores = true;
-    } else {
-        info.has_hybrid_cores = false;
-        // If not hybrid, ensure all marked as Big for consistency (though mask handles it)
-        if p_cores_found == 0 && e_cores_found > 0 {
-            // Weird case: All E-cores? Treat as "Big" relative to nothing.
-            // But we keep as is.
-        }
     }
 
     // Log detected topology (debug level - use RUST_LOG=debug to see)

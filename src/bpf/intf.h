@@ -29,7 +29,6 @@ enum cider_tier {
     CAKE_TIER_INTERACT  = 1,  /* <2ms:    compositor, physics, AI */
     CAKE_TIER_FRAME     = 2,  /* <8ms:    game render, encoding */
     CAKE_TIER_BULK      = 3,  /* ≥8ms:    compilation, background */
-    CAKE_TIER_IDLE      = 255,
     CAKE_TIER_MAX       = 4,
 };
 
@@ -138,15 +137,9 @@ struct cider_task_ctx {
 
 /* Mailbox flags (packed in flags byte) */
 #define MBOX_TIER_MASK    0x03  /* Bits [1:0] = tier (0-3) */
-#define MBOX_VICTIM_BIT   0x08  /* Bit  [3]   = victim (preemptible) */
-#define MBOX_IDLE_BIT     0x10  /* Bit  [4]   = idle (no task running) */
-#define MBOX_WARM_BIT     0x20  /* Bit  [5]   = cache warm (recent run) */
 
 /* Mailbox flag accessors */
 #define MBOX_GET_TIER(f)   ((f) & MBOX_TIER_MASK)
-#define MBOX_IS_VICTIM(f)  ((f) & MBOX_VICTIM_BIT)
-#define MBOX_IS_IDLE(f)    ((f) & MBOX_IDLE_BIT)
-#define MBOX_IS_WARM(f)    ((f) & MBOX_WARM_BIT)
 
 /* 64-byte mega-mailbox entry (single cache line = optimal L1 efficiency)
  * Per-CPU write isolation: each CPU writes ONLY its own entry.
@@ -176,7 +169,6 @@ struct cider_stats {
 /* Default values (Gaming profile) */
 #define CAKE_DEFAULT_QUANTUM_NS         (2 * 1000 * 1000)   /* 2ms */
 #define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */
-#define CAKE_DEFAULT_STARVATION_NS      (100 * 1000 * 1000) /* 100ms */
 
 /* Default tier arrays (Gaming profile) — 4 tiers */
 
@@ -189,8 +181,17 @@ struct cider_stats {
 /* Tier quantum multipliers (fixed-point, 1024 = 1.0x)
  * Power-of-4 progression: each tier gets 4x the quantum of the tier above.
  * T2 at 4ms lets 300fps+ render threads complete entire frames without preemption.
- * T0 at 0.5ms releases cores to game work faster (T0 runs <100µs anyway). */
-#define CAKE_DEFAULT_MULTIPLIER_T0  256    /* Critical: 0.25x = 0.5ms */
+ * T0 at 1ms releases cores to game work faster (T0 runs <100µs anyway).
+ *
+ * FIX (#5): T0 default raised from 256 (0.25x = 0.5ms) to 512 (0.5x = 1ms) to
+ * match the Gaming profile multiplier written by the userspace loader.  Previously
+ * the BPF RODATA default and the Gaming profile were silently divergent: if the
+ * loader's rodata_data write were ever skipped (skeleton version mismatch, future
+ * refactor), T0 audio/input tasks would receive 0.5ms slices instead of 1ms,
+ * causing them to release their CPU before completing useful work — the opposite
+ * of the intended behaviour.  Keeping the two values in sync makes the fallback
+ * safe and documents the canonical Gaming intent at the definition site. */
+#define CAKE_DEFAULT_MULTIPLIER_T0  512    /* Critical: 0.5x  = 1.0ms */
 #define CAKE_DEFAULT_MULTIPLIER_T1  1024   /* Interact: 1.0x  = 2.0ms */
 #define CAKE_DEFAULT_MULTIPLIER_T2  2048   /* Frame:    2.0x  = 4.0ms */
 #define CAKE_DEFAULT_MULTIPLIER_T3  4095   /* Bulk:     ~4.0x = 8.0ms (12-bit max = 4095) */

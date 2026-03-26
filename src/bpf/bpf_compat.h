@@ -108,7 +108,6 @@
         return de_bruijn_bits[(lsb * mult) >> 58];
     }
     #define BIT_SCAN_FORWARD_U64(mask) cider_ctz64(mask, 0x022FDD63CC95386DULL)
-    #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) cider_ctz64(mask, mult)
 
     /* FIX (#15): U32-specific BSF using De Bruijn sequence for 32-bit masks.
      * Avoids zero-extending u32 into the 64-bit De Bruijn table which uses a
@@ -125,7 +124,6 @@
     #define BIT_SCAN_FORWARD_U32(mask) cider_ctz32(mask)
 #else
     #define BIT_SCAN_FORWARD_U64(mask) __builtin_ctzll(mask)
-    #define BIT_SCAN_FORWARD_U64_RAW(mask, mult) __builtin_ctzll(mask)
     /* FIX (#15): Use __builtin_ctz for u32 operands (correct width, avoids implicit widening) */
     #define BIT_SCAN_FORWARD_U32(mask) __builtin_ctz(mask)
 #endif

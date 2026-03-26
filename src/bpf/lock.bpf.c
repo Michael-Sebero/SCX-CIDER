@@ -96,6 +96,16 @@ static __always_inline void clear_lock_holder(void)
 }
 
 /* ── fexit probes (primary path, ~50 ns overhead) ───────────────────────── */
+/*
+ * NOTE: On kernels that export both the fexit target symbols AND the
+ * sys_enter/exit_futex tracepoints (which are universally available), both
+ * path families attach simultaneously.  A single futex_wait returning 0 will
+ * therefore call set_lock_holder() twice — once via fexit, once via tracepoint.
+ * The double atomic-OR is idempotent and correctness is preserved.  The
+ * ~130 ns tracepoint overhead is paid unnecessarily on these kernels, but no
+ * mutual-exclusion mechanism is implemented because the cost is low relative
+ * to the futex syscall itself.  This is an accepted known tradeoff.
+ */
 
 /*
  * futex_wait variants — lock *acquired* on return value 0.
@@ -109,23 +119,6 @@ SEC("?fexit/__futex_wait")
 int BPF_PROG(cider_fexit_futex_wait,
              u32 *uaddr, unsigned int flags, u32 val,
              struct hrtimer_sleeper *to, u32 bitset,
-             int ret)
-{
-    if (ret == 0)
-        set_lock_holder();
-    return 0;
-}
-
-/*
- * int futex_wait_multiple(struct futex_vector *vs, unsigned int count,
- *                         struct hrtimer_sleeper *to)
- */
-struct futex_vector;
-
-SEC("?fexit/futex_wait_multiple")
-int BPF_PROG(cider_fexit_futex_wait_multiple,
-             struct futex_vector *vs, unsigned int count,
-             struct hrtimer_sleeper *to,
              int ret)
 {
     if (ret == 0)
@@ -321,14 +314,6 @@ SEC("?tracepoint/syscalls/sys_exit_futex_wait")
 int cider_tp_exit_futex_wait(struct tp_cider_futex_exit *ctx)
 {
     if (ctx->ret == 0)
-        set_lock_holder();
-    return 0;
-}
-
-SEC("?tracepoint/syscalls/sys_exit_futex_waitv")
-int cider_tp_exit_futex_waitv(struct tp_cider_futex_exit *ctx)
-{
-    if (ctx->ret >= 0)
         set_lock_holder();
     return 0;
 }
