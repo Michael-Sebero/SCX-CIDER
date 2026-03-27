@@ -46,6 +46,15 @@
  *   since the flag is a single bit.
  * - CAKE_FLAG_LOCK_HOLDER is never explicitly cleared on task death because
  *   the task context itself is freed; there is no stale-flag risk.
+ * - FUTEX_CMP_REQUEUE_PI transfers lock ownership to a new task without the
+ *   new owner ever calling futex_wait or futex_lock_pi.  Neither the fexit
+ *   probes nor the tracepoint fallback cover this implicit grant, so the new
+ *   owner's CAKE_FLAG_LOCK_HOLDER is not set until its next explicit
+ *   futex_wait or futex_lock_pi call.  This is uncommon (primarily glibc
+ *   condition variables with priority ceiling, rare in Wine/Proton) and
+ *   represents a missed optimisation for a single-frame window, not a
+ *   correctness failure.  A future fexit probe on futex_requeue() on the
+ *   WAKING side would close this gap.
  */
 
 #include <scx/common.bpf.h>
@@ -89,10 +98,29 @@ static __always_inline void clear_lock_holder(void)
         return;
 
     tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    if (tctx)
-        /* Atomic AND: safe against concurrent reads in cider_tick/cider_enqueue */
+    if (tctx) {
+        /* FIX (clear-order): Clear the flag BEFORE resetting lock_skip_count.
+         * A tick interrupt firing between the two stores observes
+         * CAKE_FLAG_LOCK_HOLDER already cleared and never reaches the
+         * lock_skip_count increment in cider_tick, so the skip budget is
+         * not silently decremented for the next lock acquisition.
+         *
+         * Previous order (counter reset first, then flag clear) left a ~1 ns
+         * window where a tick could see the flag still set, increment the
+         * counter back to 1, and then clear_lock_holder() would clear the
+         * flag — leaving lock_skip_count = 1 instead of 0.  Over many
+         * lock/unlock cycles on a hot audio or D3D submission thread this
+         * erodes the 4-skip budget, causing premature preemption of a lock
+         * holder. */
         __sync_fetch_and_and(&tctx->packed_info,
                              ~((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS));
+        /* Reset the skip counter so the next lock acquisition starts with a
+         * fresh cap of 4 consecutive skip allowances.  Plain store is safe:
+         * lock_skip_count is only read and written by cider_tick on the CPU
+         * currently running this task, and clear_lock_holder fires in a
+         * fexit/tracepoint context on the same CPU. */
+        tctx->lock_skip_count = 0;
+    }
 }
 
 /* ── fexit probes (primary path, ~50 ns overhead) ───────────────────────── */
@@ -159,6 +187,30 @@ int BPF_PROG(cider_fexit_futex_lock_pi,
 }
 
 /*
+ * FIX (gap/trylock-pi): futex_trylock_pi was the only PI-futex variant without
+ * a fexit probe, creating an asymmetry between the fexit path and the tracepoint
+ * fallback (which already handled CAKE_FUTEX_TRYLOCK_PI in cider_tp_exit_futex).
+ * On kernels that export futex_trylock_pi as a BPF fexit target, this probe
+ * fires at ~50ns overhead instead of the ~130ns tracepoint path.  The SEC("?...")
+ * prefix keeps the load safe on kernels that do not export the symbol — the
+ * tracepoint fallback remains active as a backup, and the resulting idempotent
+ * double-set_lock_holder() is harmless (same semantics as the other probe pairs).
+ *
+ * int futex_trylock_pi(u32 *uaddr, unsigned int flags, ktime_t *time, int trylock)
+ * PI trylock — lock *acquired* on return value 0.
+ */
+SEC("?fexit/futex_trylock_pi")
+int BPF_PROG(cider_fexit_futex_trylock_pi,
+             u32 *uaddr, unsigned int flags,
+             ktime_t *time, int trylock,
+             int ret)
+{
+    if (ret == 0)
+        set_lock_holder();
+    return 0;
+}
+
+/*
  * futex_wake variants — lock *released*; clear the flag.
  *
  * int futex_wake(u32 *uaddr, unsigned int flags, int nr_wake, u32 bitset)
@@ -208,22 +260,29 @@ int BPF_PROG(cider_fexit_futex_unlock_pi,
  *
  * When fexit probes fail to attach (kernel does not export the symbol),
  * the tracepoint path provides equivalent coverage via the stable
- * syscalls ABI. A per-CPU scratch cell holds the futex op observed at
- * sys_enter so that sys_exit can branch correctly.
+ * syscalls ABI.
  *
- * Note: like LAVD, we do not distinguish futex user addresses to keep
- * tracing overhead minimal. The resulting approximation is identical to
- * the fexit path for contended locks.
+ * FIX (migration): The previous implementation stored the futex op in a
+ * per-CPU scratch array (lock_scratch[smp_processor_id()]) at sys_enter
+ * and read it back at sys_exit.  Blocking futex_wait variants put the
+ * calling task to sleep inside the kernel; Linux may wake it on a
+ * different CPU, so the CPU at sys_exit is not guaranteed to be the same
+ * CPU at sys_enter.  The mismatch causes cider_tp_exit_futex to read
+ * whichever op the *new* CPU's scratch last recorded — potentially a
+ * WAKE op — and call clear_lock_holder() for a task that just acquired
+ * a lock (ret == 0), discarding the priority boost silently.
+ *
+ * Fix: record the op in cider_task_ctx.pending_futex_op (per-task storage,
+ * carried with the task across migrations) and read it back in the exit
+ * handler on whichever CPU the task wakes up on.  The lock_scratch array
+ * and its cider_lock_scratch struct are no longer needed and are removed.
+ *
+ * The CAKE_FUTEX_OP_UNSET (0xFF) guard in the exit handler protects against
+ * the narrow window where both tracepoints attach after a sys_enter_futex
+ * but before its sys_exit_futex — or when cider_init_task in cider_bpf.c
+ * has not yet initialised pending_futex_op (BPF task-storage zero-inits
+ * new entries; 0 == CAKE_FUTEX_WAIT, which would be a false set_lock_holder).
  */
-
-/* Per-CPU scratch for the futex op seen at sys_enter */
-struct cider_lock_scratch {
-    int futex_op;
-    u8  _pad[60]; /* cache-line isolated */
-} __attribute__((aligned(64)));
-
-struct cider_lock_scratch lock_scratch[CAKE_MAX_CPUS] SEC(".bss")
-    __attribute__((aligned(64)));
 
 /* Futex op constants (from uapi/linux/futex.h) */
 #define CAKE_FUTEX_WAIT          0
@@ -239,7 +298,6 @@ struct cider_lock_scratch lock_scratch[CAKE_MAX_CPUS] SEC(".bss")
 #define CAKE_FUTEX_PRIVATE_FLAG  128
 #define CAKE_FUTEX_CLOCK_RT      256
 #define CAKE_FUTEX_CMD_MASK      (~(CAKE_FUTEX_PRIVATE_FLAG | CAKE_FUTEX_CLOCK_RT))
-#define CAKE_FUTEX_OP_INVALID    (-1)
 
 struct tp_cider_futex_enter {
     /* trace_entry fields (opaque here) */
@@ -259,17 +317,41 @@ struct tp_cider_futex_exit {
 SEC("?tracepoint/syscalls/sys_enter_futex")
 int cider_tp_enter_futex(struct tp_cider_futex_enter *ctx)
 {
-    u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    lock_scratch[cpu].futex_op = ctx->op;
+    struct task_struct *p = bpf_get_current_task_btf();
+    struct cider_task_ctx *tctx;
+
+    if (!p)
+        return 0;
+    tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (tctx)
+        /* Store raw op as u8.  CLOCK_RT (bit 8 = 256) truncates to 0, which is
+         * harmless: CAKE_FUTEX_CMD_MASK strips it in the exit handler regardless.
+         * All valid cmd values (0–13) fit in a u8. */
+        tctx->pending_futex_op = (u8)(ctx->op);
     return 0;
 }
 
 SEC("?tracepoint/syscalls/sys_exit_futex")
 int cider_tp_exit_futex(struct tp_cider_futex_exit *ctx)
 {
-    u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    int cmd = lock_scratch[cpu].futex_op & CAKE_FUTEX_CMD_MASK;
+    struct task_struct *p = bpf_get_current_task_btf();
+    struct cider_task_ctx *tctx;
+    int cmd;
     long ret = ctx->ret;
+
+    if (!p)
+        return 0;
+    tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (!tctx)
+        return 0;
+
+    /* Guard: treat uninitialised storage as a no-op.  cider_init_task writes
+     * CAKE_FUTEX_OP_UNSET (0xFF) so this fires only in the attach-race window
+     * or on kernels without a cider_init_task hook. */
+    if (tctx->pending_futex_op == CAKE_FUTEX_OP_UNSET)
+        return 0;
+
+    cmd = (int)(tctx->pending_futex_op) & CAKE_FUTEX_CMD_MASK;
 
     switch (cmd) {
     case CAKE_FUTEX_WAIT:

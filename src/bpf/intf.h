@@ -48,6 +48,13 @@ _Static_assert(CAKE_TIER_MAX <= 8,
 /* Per-LLC DSQ base — DSQ IDs are LLC_DSQ_BASE + llc_index (0..nr_llcs-1) */
 #define LLC_DSQ_BASE 200
 
+/* ETD cross-LLC latency tolerance for work-stealing preference (4 ns/unit).
+ * When choosing which LLC to steal from, an LLC within THRESHOLD units of the
+ * cheapest candidate is still acceptable.  5 units = 20 ns tolerance: enough
+ * to absorb measurement noise while still preferring the lowest-latency CCD.
+ * No work is ever skipped — this only reorders, never filters, steal attempts. */
+#define CAKE_ETD_CROSS_LLC_THRESHOLD 5
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * FLOW STATE FLAGS — live in the 4-bit FLAGS nibble of packed_info.
  * SHIFT_FLAGS = 24, MASK_FLAGS = 0x0F → bits 24–27 of packed_info.
@@ -105,8 +112,37 @@ struct cider_task_ctx {
      * After 4 consecutive overruns, forces a one-tier demotion regardless of
      * EWMA, cutting worst-case misclassification from ~128ms to ~8ms. */
     u8 overrun_count;      /* 1B: consecutive overrun counter */
-    u8 __pad[41];          /* Pad to 64 bytes: 8+8+4+2+1+41 = 64 */
+
+    /* FIX (gap/lock-skip-cap): Counts consecutive ticks where starvation
+     * preemption was skipped because the task holds a futex.  Capped at 4 in
+     * cider_tick to bound the maximum extra T0 latency to ~4ms.  Reset to 0
+     * by clear_lock_holder() when the futex is released, and on any forced
+     * preemption after the cap is reached.  Plain assignment is safe: this
+     * field is only written by cider_tick on the CPU currently running the
+     * task — no cross-CPU data race is possible. */
+    u8 lock_skip_count;    /* 1B: consecutive lock-holder starvation skip counter */
+
+    /* FIX (migration): futex op recorded at sys_enter_futex for the tracepoint
+     * fallback path in lock_bpf.c.  Storing it here (per-task) rather than in
+     * the per-CPU lock_scratch array means the op is visible on whichever CPU
+     * the task is scheduled after a blocking futex_wait — avoiding the stale-op
+     * mismatch that occurs when a task migrates between syscall entry and exit.
+     *
+     * Initialised to CAKE_FUTEX_OP_UNSET (0xFF) by cider_bpf.c::cider_init_task
+     * so that sys_exit_futex probes that fire before any sys_enter_futex has been
+     * seen for this task fall through the switch as a no-op.  BPF task-storage
+     * zero-initialises new entries; zero maps to CAKE_FUTEX_WAIT, so the init
+     * in cider_init_task is required for correctness.
+     *
+     * Written only from cider_tp_enter_futex (tracepoint context, same CPU as
+     * the syscall entry, no concurrency with cider_tp_exit_futex for the same
+     * task).  Read only from cider_tp_exit_futex.  Plain byte store is safe. */
+    u8 pending_futex_op;   /* 1B: futex cmd byte recorded at sys_enter (TP path) */
+    u8 __pad[39];          /* Pad to 64 bytes: 8+8+4+2+1+1+1+39 = 64 */
 } __attribute__((aligned(64)));
+
+_Static_assert(sizeof(struct cider_task_ctx) == 64,
+    "cider_task_ctx must be exactly 64B (one cache line) — update __pad if fields change");
 
 /* Bitfield layout for packed_info (write-set co-located, Rule 24 mask fusion):
  * [Stable:2][Tier:2][Flags:4][Rsvd:8][Wait:8][Error:8]
@@ -241,5 +277,13 @@ typedef u64 fused_config_t;
      (((u64)(q_kns) & CFG_MASK_QUANTUM) << CFG_SHIFT_QUANTUM) | \
      (((u64)(budget_kns) & CFG_MASK_BUDGET) << CFG_SHIFT_BUDGET) | \
      (((u64)(starv_kns) & CFG_MASK_STARVATION) << CFG_SHIFT_STARVATION))
+
+/* FIX (migration): Sentinel for pending_futex_op in cider_task_ctx.
+ * cider_bpf.c::cider_init_task must write this value so that the tracepoint
+ * exit handler treats a task that has not yet entered sys_enter_futex as a
+ * no-op, rather than misinterpreting the zero-initialised storage as
+ * CAKE_FUTEX_WAIT (op=0).  0xFF is safe: all valid futex cmd values after
+ * applying CAKE_FUTEX_CMD_MASK are 0–13, so 0xFF never aliases a real op. */
+#define CAKE_FUTEX_OP_UNSET  0xFF
 
 #endif /* __CAKE_INTF_H */

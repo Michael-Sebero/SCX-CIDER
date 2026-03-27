@@ -274,8 +274,6 @@ where
                         );
                     }
 
-                    // Report progress (not complete yet)
-                    progress_callback(current_pair, total_pairs, false);
                     break;
                 } else {
                     retry_count += 1;
@@ -285,6 +283,30 @@ where
                     );
                 }
             }
+
+            // FIX (#1): When measure_pair() returns None (affinity pinning denied),
+            // the while-let body never executes and the matrix entries stay at 0.0.
+            // A 0.0 entry is the smallest possible latency value and will always win
+            // the ETD work-stealing comparison, permanently routing steals to the
+            // failed pair regardless of actual topology distance.  Fill with a large
+            // sentinel (500 ns covers worst-case cross-NUMA on Threadripper/EPYC) so
+            // the pair is treated as expensive rather than free.
+            //
+            // FIX (#5): progress_callback was only called inside the while-let body
+            // (success path).  An affinity failure silently skips the callback,
+            // leaving the TUI progress counter stuck.  Move the call here so it fires
+            // unconditionally after every pair — whether the measurement succeeded,
+            // hit max retries, or the threads could not be pinned.
+            if matrix[cpu_a][cpu_b] == 0.0 {
+                const ETD_FALLBACK_NS: f64 = 500.0;
+                matrix[cpu_a][cpu_b] = ETD_FALLBACK_NS;
+                matrix[cpu_b][cpu_a] = ETD_FALLBACK_NS;
+                warn!(
+                    "ETD: CPU {}<->{} affinity/measurement failed, using fallback {:.0}ns",
+                    cpu_a, cpu_b, ETD_FALLBACK_NS
+                );
+            }
+            progress_callback(current_pair, total_pairs, false);
         }
     }
 

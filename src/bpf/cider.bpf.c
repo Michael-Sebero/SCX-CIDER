@@ -94,6 +94,16 @@ struct cider_stats global_stats[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligne
 /* BSS tail guard - absorbs BTF truncation bugs instead of corrupting real data */
 u8 __bss_tail_guard[64] SEC(".bss") __attribute__((aligned(64)));
 
+/* LLC-pair ETD latency cost table — written from userspace after ETD calibration.
+ * Unit: 4 ns/unit (0 = unknown or same LLC, 255 = ~1020 ns).
+ * Zero-initialised (BSS): safe default before calibration completes — the steal
+ * path treats all-zero costs as "no preference" and falls back to index order.
+ *
+ * Layout: llc_etd_cost[src_llc][dst_llc].  Values are symmetric (min round-trip
+ * latency / 2) and set by the Rust-side try_write_etd_costs() after ETD finishes. */
+u8 llc_etd_cost[CAKE_MAX_LLCS][CAKE_MAX_LLCS] SEC(".bss")
+    __attribute__((aligned(64)));
+
 /* Mailbox mask builders removed — select_cpu now delegates idle detection
  * to scx_bpf_select_cpu_dfl() which uses the kernel's authoritative idle
  * tracking (zero staleness, atomic claiming). */
@@ -810,13 +820,42 @@ void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
      * On a dual-CCD system with nr_llcs=2 the old loop ran 8 iterations
      * with 6 unconditional i < nr_llcs misses.  The JIT treats nr_llcs as a
      * bounded constant and unrolls/DCEs the body accordingly. */
-    u32 steal_mask = 0;
+    /* FIX (gap/etd-steal): ETD-cost-aware work stealing.
+     * When llc_etd_cost[] has been populated by userspace after ETD calibration,
+     * prefer stealing from the lowest-latency source LLC first.  This reduces
+     * cross-CCD cache-miss penalties on dual-CCD systems (e.g. 9950X) by trying
+     * the cheaper CCD before the more expensive one.
+     *
+     * Correctness: all LLCs are still attempted — cheapest_llc is tried first,
+     * then remaining LLCs in BSF order.  No work is ever skipped or dropped.
+     * When costs are all 0 (pre-calibration), cheapest_llc sentinel remains at
+     * nr_llcs and the loop degrades to the original index-order behaviour. */
+    u32 steal_mask   = 0;
+    u32 cheapest_llc = nr_llcs;  /* sentinel: no ETD-preferred candidate */
+    u8  min_cost     = 0;        /* 0 = no calibration data present */
+
     for (u32 i = 0; i < nr_llcs; i++) {
         if (i != my_llc &&
-            cider_relaxed_load_u8(&llc_nonempty[i].nonempty))
+            cider_relaxed_load_u8(&llc_nonempty[i].nonempty)) {
             steal_mask |= 1u << i;
+            u8 c = llc_etd_cost[my_llc & (CAKE_MAX_LLCS - 1)][i & (CAKE_MAX_LLCS - 1)];
+            /* Only update cheapest when ETD data is present (c > 0). */
+            if (c > 0 && (min_cost == 0 || c < min_cost)) {
+                min_cost     = c;
+                cheapest_llc = i;
+            }
+        }
     }
 
+    /* Steal from cheapest LLC first when ETD data is available */
+    if (cheapest_llc < nr_llcs && min_cost > 0) {
+        steal_mask &= ~(1u << cheapest_llc);
+        if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + cheapest_llc))
+            return;
+        cider_relaxed_store_u8(&llc_nonempty[cheapest_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+    }
+
+    /* Try remaining LLCs in BSF order (original behaviour) */
     for (u32 i = 0; steal_mask && i < nr_llcs; i++) {
         /* i is a verifier-required trip-count bound; actual iteration is BSF-driven.
          * steal_mask bits are set only for indices in [0, nr_llcs) by the loop above,
@@ -923,12 +962,27 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
                  * path (not a lock holder). */
                 u32 tick_packed = cider_relaxed_load_u32(&tctx_reg->packed_info);
                 if (unlikely(tick_packed & ((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS))) {
-                    /* Skip preempt — let the lock holder finish the critical section */
-                    if (enable_stats) {
-                        struct cider_stats *s = get_local_stats();
-                        if (s) s->nr_lock_holder_skips++;
+                    /* FIX (gap/lock-skip-cap): Cap consecutive skips at 4.
+                     * Each skip defers preemption by one starvation-threshold
+                     * window; with a 1ms tick rate the cap fires within ~4ms
+                     * of the first skip, bounding the maximum additional T0
+                     * latency regardless of how long the critical section runs.
+                     *
+                     * After 4 skips, fall through to normal starvation preemption
+                     * and reset the counter so the next lock acquisition starts
+                     * with a fresh allowance. */
+                    u8 skips = tctx_reg->lock_skip_count;
+                    if (skips < 4) {
+                        tctx_reg->lock_skip_count = skips + 1;
+                        if (enable_stats) {
+                            struct cider_stats *s = get_local_stats();
+                            if (s) s->nr_lock_holder_skips++;
+                        }
+                        goto mailbox_dvfs;  /* Still update mailbox and DVFS */
                     }
-                    goto mailbox_dvfs;  /* Still update mailbox and DVFS */
+                    /* Cap reached: fall through to starvation preemption.
+                     * Reset so next lock acquisition starts with a full cap. */
+                    tctx_reg->lock_skip_count = 0;
                 }
 
                 scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
@@ -1330,9 +1384,62 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
                    struct scx_init_task_args *args)
 {
     /* init_task fires for every task entering scx control, not just forked
-     * children.  Only seed from parent when this is actually a fork. */
-    if (!args->fork)
+     * children.  For exec() (args->fork == false) the task retains its old
+     * task_struct — and therefore its old cider_task_ctx — from before the
+     * exec.  A shell or build tool that execs a game binary would carry a T3
+     * avg_runtime classification into the new process image, causing the game's
+     * first render threads to compete at T3 for 6-16 EWMA bouts before
+     * converging to the correct tier.
+     *
+     * Fix: reset avg_runtime and tier to the nice-value-based midpoint (same
+     * logic as alloc_task_ctx_cold) so the post-exec EWMA starts from a
+     * sensible prior rather than the pre-exec process's stale history. */
+    if (!args->fork) {
+        struct cider_task_ctx *tctx = get_task_ctx(p, false);
+        if (!tctx)
+            return 0;
+
+        u32 prio = p->static_prio;
+        u8  init_tier;
+        u16 init_avg_rt;
+
+        if (prio < 120) {
+            init_tier   = CAKE_TIER_CRITICAL;
+            init_avg_rt = TIER_GATE_T0 / 2;
+        } else if (prio > 130) {
+            init_tier   = CAKE_TIER_BULK;
+            init_avg_rt = TIER_GATE_T2 + 1;
+        } else {
+            init_tier   = CAKE_TIER_INTERACT;
+            init_avg_rt = (TIER_GATE_T0 + TIER_GATE_T1) / 2;
+        }
+
+        /* Reset tier[29:28] + stable[31:30] to (stable=0, tier=init_tier).
+         * All other packed_info bits (FLAGS, WAIT_DATA, KALMAN_ERROR) are
+         * preserved — CAKE_FLOW_NEW is already set by alloc_task_ctx_cold
+         * and is still appropriate for a freshly exec'd process. */
+        u32 packed = cider_relaxed_load_u32(&tctx->packed_info);
+        packed &= ~((u32)0xF << 28);
+        packed |=  (u32)init_tier << SHIFT_TIER;
+        cider_relaxed_store_u32(&tctx->packed_info, packed);
+
+        /* Reset avg_runtime to tier midpoint; preserve existing deficit so the
+         * new-flow bonus (already credited) is not revoked. */
+        u32 old_fused = tctx->deficit_avg_fused;
+        tctx->deficit_avg_fused =
+            PACK_DEFICIT_AVG(EXTRACT_DEFICIT(old_fused), init_avg_rt);
+
+        tctx->overrun_count   = 0;
+        tctx->reclass_counter = 0;
+        tctx->lock_skip_count = 0;
+
+        /* Recompute pre-fetched slice for the reset tier */
+        u64 cfg  = tier_configs[CAKE_TIER_IDX(init_tier)];
+        u64 mult = UNPACK_MULTIPLIER(cfg);
+        tctx->next_slice = (quantum_ns * mult) >> 10;
+
         return 0;
+    }
 
     struct task_struct *parent = p->real_parent;
     struct cider_task_ctx *ptctx = parent ?

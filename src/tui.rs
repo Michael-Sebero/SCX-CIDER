@@ -56,6 +56,19 @@ pub struct TuiApp {
     start_time: Instant,
     status_message: Option<(String, Instant)>,
     topology: TopologyInfo,
+    /// Snapshot taken at the previous tick — used to compute per-second rates.
+    prev_stats: cider_stats,
+    /// Wall-clock time of the previous snapshot, used for delta-time divisor.
+    prev_tick: Instant,
+}
+
+/// Per-second event rates derived from two consecutive stats snapshots.
+/// Values are f64 so fractional rates display correctly at slow intervals.
+pub struct StatsRates {
+    /// Per-tier starvation preemptions per second.
+    pub starve_per_sec: [f64; 4],
+    /// Lock-holder starvation skips per second (system-wide).
+    pub lock_skip_per_sec: f64,
 }
 
 impl TuiApp {
@@ -64,7 +77,50 @@ impl TuiApp {
             start_time: Instant::now(),
             status_message: None,
             topology,
+            prev_stats: cider_stats::default(),
+            prev_tick: Instant::now(),
         }
+    }
+
+    /// Compute per-second rates relative to the stored previous snapshot, then
+    /// update the snapshot.  Called once per TUI refresh with the latest aggregated
+    /// stats so that the rates always reflect the most recent `interval_secs` window.
+    ///
+    /// Handles counter resets (the `[r]` key zeroes BSS): when a new value is less
+    /// than the previous, the delta is clamped to zero for that field rather than
+    /// producing a large negative or wrap-around spike.
+    pub fn tick_stats(&mut self, current: &cider_stats) -> StatsRates {
+        let elapsed_secs = self.prev_tick.elapsed().as_secs_f64().max(0.001);
+
+        let delta = |cur: u64, prev: u64| -> f64 {
+            (cur.saturating_sub(prev)) as f64 / elapsed_secs
+        };
+
+        let mut starve_per_sec = [0.0f64; 4];
+        for i in 0..4 {
+            starve_per_sec[i] = delta(
+                current.nr_starvation_preempts_tier[i],
+                self.prev_stats.nr_starvation_preempts_tier[i],
+            );
+        }
+        let lock_skip_per_sec = delta(
+            current.nr_lock_holder_skips,
+            self.prev_stats.nr_lock_holder_skips,
+        );
+
+        // Advance snapshot
+        self.prev_stats = *current;
+        self.prev_tick  = Instant::now();
+
+        StatsRates { starve_per_sec, lock_skip_per_sec }
+    }
+
+    /// Invalidate the previous-stats snapshot so the next tick_stats() call
+    /// produces a fresh window rather than a misleading spike.  Called when
+    /// the user resets BSS counters with `[r]`.
+    pub fn invalidate_rates(&mut self) {
+        self.prev_stats = cider_stats::default();
+        self.prev_tick  = Instant::now();
     }
 
     /// Format uptime as "Xm Ys" or "Xh Ym"
@@ -850,8 +906,8 @@ fn format_stats_for_clipboard(stats: &cider_stats, uptime: &str) -> String {
         total_dispatches, new_pct
     ));
 
-    output.push_str("Tier           Dispatches    StarvPreempt\n");
-    output.push_str("───────────────────────────────────────────\n");
+    output.push_str("Tier           Dispatches    StarvTotal   (Starve/s is live-only)\n");
+    output.push_str("──────────────────────────────────────────────────────────────────\n");
     for (i, name) in TIER_NAMES.iter().enumerate() {
         output.push_str(&format!(
             "{:12}   {:>10}    {:>12}\n",
@@ -868,7 +924,7 @@ fn format_stats_for_clipboard(stats: &cider_stats, uptime: &str) -> String {
 }
 
 /// Draw the UI
-fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats) {
+fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats, rates: &StatsRates) {
     let area = frame.area();
 
     // Create main layout: header, stats table, footer
@@ -932,7 +988,12 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats) {
     frame.render_widget(header, layout[0]);
 
     // --- Stats Table ---
-    let header_cells = ["Tier", "Dispatches", "StarvPreempt", "LockSkip", "IRQBoost", "WakerBoost"].iter().map(|h| {
+    // FIX (gap/tui-rates): Added "Starve/s" column showing live per-tier starvation
+    // preemption rate.  This makes the starvation thresholds (3/8/40/100ms) observable
+    // in real time — a non-zero T0 Starve/s signals that audio/input tasks are being
+    // held past their threshold and the T0 gate should be tightened.  The cumulative
+    // "StarvTotal" column is preserved alongside it for session-level context.
+    let header_cells = ["Tier", "Dispatches", "StarvTotal", "Starve/s", "LockSkip", "IRQBoost", "WakerBoost"].iter().map(|h| {
         Cell::from(*h).style(
             Style::default()
                 .fg(Color::Yellow)
@@ -945,10 +1006,26 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats) {
         .iter()
         .enumerate()
         .map(|(i, name)| {
+            // Format Starve/s: show "—" when rate is zero (quiet) to avoid noise,
+            // and highlight non-zero T0/T1 rates in red since they indicate latency
+            // threshold breaches that may be perceptible to the user.
+            let starve_rate = rates.starve_per_sec[i];
+            let starve_rate_cell = if starve_rate < 0.05 {
+                Cell::from("—").style(Style::default().fg(Color::DarkGray))
+            } else if i <= 1 {
+                // T0/T1 breach — highlight red: these are the latency-sensitive tiers
+                Cell::from(format!("{:.1}/s", starve_rate))
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from(format!("{:.1}/s", starve_rate))
+                    .style(Style::default().fg(Color::Yellow))
+            };
+
             let cells = vec![
                 Cell::from(*name).style(tier_style(i)),
                 Cell::from(format!("{}", stats.nr_tier_dispatches[i])),
                 Cell::from(format!("{}", stats.nr_starvation_preempts_tier[i])),
+                starve_rate_cell,
                 // Lock-holder skip and IRQ/waker boost counters are system-wide (not
                 // per-tier), so only show them on the T0 row to avoid duplication.
                 Cell::from(if i == 0 { format!("{}", stats.nr_lock_holder_skips) } else { String::new() }),
@@ -964,7 +1041,8 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats) {
         [
             Constraint::Length(12),
             Constraint::Length(12),
-            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(12),
@@ -980,12 +1058,21 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats) {
     frame.render_widget(table, layout[1]);
 
     // --- Summary ---
+    // Show lock_skip/s alongside total so the cap behaviour (Fix 2) is visible:
+    // persistent lock_skip/s > 0 after the cap fires indicates a task spending
+    // most of its time holding a futex — useful for diagnosing Wine/Proton stalls.
     let total_starvation: u64 = stats.nr_starvation_preempts_tier.iter().sum();
+    let lock_skip_rate_str = if rates.lock_skip_per_sec < 0.05 {
+        String::from("—")
+    } else {
+        format!("{:.1}/s", rates.lock_skip_per_sec)
+    };
     let summary_text = format!(
-        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} | IRQ boosts: {} | Waker boosts: {}",
+        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} ({}) | IRQ boosts: {} | Waker boosts: {}",
         stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches,
         total_starvation,
         stats.nr_lock_holder_skips,
+        lock_skip_rate_str,
         stats.nr_irq_wake_boosts,
         stats.nr_waker_tier_boosts,
     );
@@ -1073,8 +1160,13 @@ pub fn run_tui(
         // Get current stats (aggregate from per-cpu BSS array)
         let stats = aggregate_stats(skel);
 
+        // FIX (gap/tui-rates): Compute per-second rates against the previous
+        // snapshot.  tick_stats() advances the snapshot on every call, so rates
+        // reflect exactly one `interval_secs` window rather than a session total.
+        let rates = app.tick_stats(&stats);
+
         // Draw UI
-        terminal.draw(|frame| draw_ui(frame, &app, &stats))?;
+        terminal.draw(|frame| draw_ui(frame, &app, &stats, &rates))?;
 
         // Handle events with timeout
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -1098,11 +1190,14 @@ pub fn run_tui(
                             }
                         }
                         KeyCode::Char('r') => {
-                            // Reset stats (clear the BSS array)
+                            // Reset stats (clear the BSS array) and invalidate the
+                            // rate snapshot so the next window starts clean rather
+                            // than producing a misleading negative-delta spike.
                             if let Some(bss) = &mut skel.maps.bss_data {
                                 for s in &mut bss.global_stats {
                                     *s = Default::default();
                                 }
+                                app.invalidate_rates();
                                 app.set_status("✓ Stats reset");
                             }
                         }

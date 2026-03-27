@@ -102,10 +102,20 @@
 
         u64 lsb = mask & -mask;
 
-        /* Obfuscation barrier: prevents Clang 18 from optimizing back to __builtin_ctzll */
-        asm volatile("" : "+r"(lsb));
+        /* FIX (barrier-placement): Barrier after the multiply, not after lsb.
+         * The previous `asm volatile("" : "+r"(lsb))` blocked CSE on lsb itself
+         * but left the multiply→shift→table-index chain visible to LLVM's post-RA
+         * peephole pass, which can re-derive lsb from the still-live mask register
+         * and then recognise the complete De Bruijn pattern, replacing it with
+         * __builtin_ctzll.  On Clang 18 with -O2 this emits BPF opcode 191, which
+         * crashes hardware JITs that do not implement it.  Placing the barrier after
+         * `product` forces the compiler to materialise the multiply result as a
+         * named register before the barrier, breaking the chain at the only point
+         * where a peephole rewrite is profitable. */
+        u64 product = lsb * mult;
+        asm volatile("" : "+r"(product));
 
-        return de_bruijn_bits[(lsb * mult) >> 58];
+        return de_bruijn_bits[product >> 58];
     }
     #define BIT_SCAN_FORWARD_U64(mask) cider_ctz64(mask, 0x022FDD63CC95386DULL)
 
@@ -118,8 +128,13 @@
             31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
         };
         u32 lsb = mask & (u32)(-(s32)mask);
-        asm volatile("" : "+r"(lsb));
-        return de_bruijn32[(lsb * 0x077CB531U) >> 27];
+        /* FIX (barrier-placement): Barrier after the multiply — see cider_ctz64
+         * comment.  Materialises the product register before the peephole window,
+         * preventing Clang 18 post-RA from recovering the De Bruijn sequence and
+         * substituting __builtin_ctz (which emits opcode 191 on older JITs). */
+        u32 product = lsb * 0x077CB531U;
+        asm volatile("" : "+r"(product));
+        return de_bruijn32[product >> 27];
     }
     #define BIT_SCAN_FORWARD_U32(mask) cider_ctz32(mask)
 #else

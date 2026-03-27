@@ -115,7 +115,14 @@ pub fn detect() -> Result<TopologyInfo> {
         }
 
         info.llc_cpu_mask[llc_idx] = mask;
-        if info.threads_per_ccd == 0 {
+        // FIX (#6): Use max-reduce rather than first-seen assignment.
+        // On asymmetric CCDs (e.g. Ryzen 7000X3D, one V-Cache CCD vs one
+        // throttled/partial CCD) the first LLC enumerated by the BTreeMap
+        // may have fewer online CPUs than the others.  Taking the maximum
+        // ensures threads_per_ccd reflects the largest CCD and never
+        // underestimates the fill threshold used by the BPF work-stealer.
+        // For symmetric systems (all CCDs equal) the result is identical.
+        if thread_count > info.threads_per_ccd {
             info.threads_per_ccd = thread_count;
         }
 

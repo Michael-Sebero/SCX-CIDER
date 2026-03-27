@@ -415,6 +415,11 @@ impl<'a> Scheduler<'a> {
 
         self.show_startup_splash()?;
 
+        // Write ETD LLC costs immediately if calibration finished during the
+        // startup animation (~4.2 s).  If not yet complete, the signal loop
+        // below retries every second until done.
+        let mut etd_written = self.try_write_etd_costs();
+
         if self.args.verbose {
             // Run TUI mode
             tui::run_tui(
@@ -450,7 +455,11 @@ impl<'a> Scheduler<'a> {
                     PollFd::new(BorrowedFd::borrow_raw(sfd.as_raw_fd()), PollFlags::POLLIN)
                 };
                 let mut fds = [poll_fd];
-                let result = poll(&mut fds, nix::poll::PollTimeout::from(60_000u16)); // 60 seconds
+                // Use a 1 s timeout while ETD calibration is pending so we write
+                // the LLC cost table promptly after the background thread finishes.
+                // Switch to 60 s once written to minimise wakeups.
+                let poll_ms: u16 = if etd_written { 60_000 } else { 1_000 };
+                let result = poll(&mut fds, nix::poll::PollTimeout::from(poll_ms));
 
                 match result {
                     Ok(n) if n > 0 => {
@@ -462,7 +471,11 @@ impl<'a> Scheduler<'a> {
                         break;
                     }
                     Ok(_) => {
-                        // Timeout - check UEI
+                        // Timeout - retry ETD write if not yet done
+                        if !etd_written {
+                            etd_written = self.try_write_etd_costs();
+                        }
+                        // Check UEI
                         if scx_utils::uei_exited!(&self.skel, uei) {
                             match scx_utils::uei_report!(&self.skel, uei) {
                                 Ok(reason) => {
@@ -491,6 +504,75 @@ impl<'a> Scheduler<'a> {
 
         info!("scx_cider scheduler shutting down");
         Ok(())
+    }
+
+    /// Compress the per-CPU ETD matrix into per-LLC-pair costs and write them
+    /// into the `llc_etd_cost` BSS array so the BPF dispatch path can prefer
+    /// cheaper source LLCs when stealing work across CCDs.
+    ///
+    /// Returns `true` when calibration data was present and the table was written.
+    /// Returns `false` when the matrix is still all-zeros (calibration in
+    /// progress): the BSS table remains zero, which is the safe default (BPF
+    /// dispatch falls back to index order for work stealing).
+    fn try_write_etd_costs(&mut self) -> bool {
+        let matrix = match self.latency_matrix.lock() {
+            Ok(m) => m.clone(),
+            Err(e) => e.into_inner().clone(),
+        };
+
+        if !matrix.iter().flatten().any(|&v| v > 0.0) {
+            return false;
+        }
+
+        let nr_cpus = matrix.len().min(topology::MAX_CPUS);
+        let nr_llcs = self
+            .topology
+            .llc_cpu_mask
+            .iter()
+            .filter(|&&m| m != 0)
+            .count()
+            .min(topology::MAX_LLCS);
+
+        // Borrow matrix as a shared reference so it can be copied into closures
+        // across multiple loop iterations.  &Vec<Vec<f64>> is Copy; the owned
+        // Vec is not, so a bare `move |cb| { matrix[ca][cb] }` would try to
+        // consume the Vec on the first flat_map call and fail on all subsequent
+        // ones (E0507 / E0382).
+        let matrix_ref = &matrix;
+
+        if let Some(bss) = &mut self.skel.maps.bss_data {
+            for llc_a in 0..nr_llcs {
+                for llc_b in 0..nr_llcs {
+                    if llc_a == llc_b {
+                        continue;
+                    }
+                    // Minimum measured latency between any cpu in llc_a and any cpu in llc_b.
+                    // Min over mean: the steal decision uses best-case hop cost.
+                    let min_ns = (0..nr_cpus)
+                        .filter(|&ca| self.topology.cpu_llc_id[ca] as usize == llc_a)
+                        .flat_map(|ca| {
+                            (0..nr_cpus)
+                                .filter(|&cb| self.topology.cpu_llc_id[cb] as usize == llc_b)
+                                .filter_map(move |cb| {
+                                    let v = matrix_ref[ca][cb];
+                                    if v > 0.0 { Some(v) } else { None }
+                                })
+                        })
+                        .fold(f64::MAX, f64::min);
+
+                    // Compress to u8 in 4 ns/unit (0 = unknown, 255 ≈ 1020 ns).
+                    let cost: u8 = if min_ns == f64::MAX {
+                        0
+                    } else {
+                        ((min_ns / 4.0) as u64).min(255) as u8
+                    };
+
+                    bss.llc_etd_cost[llc_a][llc_b] = cost;
+                }
+            }
+            info!("ETD: LLC cost table written ({} LLCs)", nr_llcs);
+        }
+        true
     }
 
     fn show_startup_splash(&self) -> Result<()> {
