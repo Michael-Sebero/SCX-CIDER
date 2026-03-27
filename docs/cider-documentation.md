@@ -65,21 +65,21 @@ CIDER inherits CAKE's full scheduling pipeline and adds three context-signal lay
 Hardware event
       │
       ▼
-cider_select_cpu ─── [NEW] IRQ detection ───────────────► CAKE_FLOW_IRQ_WAKE flag
+cider_select_cpu ───  IRQ detection ───────────────► CAKE_FLOW_IRQ_WAKE flag
       │                    (bpf_in_hardirq / bpf_in_serving_softirq / ksoftirqd)
       │
-      ├── SYNC fast path ──► dispatch_sync_cold ─── [NEW] consume IRQ_WAKE → T0 slice
+      ├── SYNC fast path ──► dispatch_sync_cold ───  consume IRQ_WAKE → T0 slice
       │
-      ├── Idle path ───────► SCX_DSQ_LOCAL_ON ───── [NEW] consume IRQ_WAKE → T0 slice
+      ├── Idle path ───────► SCX_DSQ_LOCAL_ON ─────  consume IRQ_WAKE → T0 slice
       │
       └── All busy ─────────────────────────────────────────────────┐
                                                                      │
                                                                      ▼
                                                               cider_enqueue
                                                                      │
-                                                         [NEW] Feature 1: IRQ tier override
-                                                         [NEW] Feature 2: Waker tier inheritance
-                                                         [NEW] Feature 3: Lock holder vtime advance
+                                                          Feature 1: IRQ tier override
+                                                          Feature 2: Waker tier inheritance
+                                                          Feature 3: Lock holder vtime advance
                                                                      │
                                                                      ▼
                                                          per-LLC DSQ (vtime = tier<<56 | ts)
@@ -89,7 +89,7 @@ cider_select_cpu ─── [NEW] IRQ detection ───────────
                                                                      │
                                                               cider_running
                                                                      │
-                                                              cider_tick ──── [NEW] Lock holder starvation skip
+                                                              cider_tick ────  Lock holder starvation skip
                                                                      │
                                                               cider_stopping (reclassify_task_cold)
                                                               EWMA update → behavioral tier for next dispatch
