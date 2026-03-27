@@ -414,67 +414,26 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
     /* ── IRQ-SOURCE WAKEUP DETECTION (adapted from LAVD lavd_select_cpu) ──
-     * Detect whether the task is being woken from a hardirq, NMI, softirq
-     * bottom-half, or a ksoftirqd kernel thread. Any of these represent
-     * completed hardware I/O whose consumer should run at T0 immediately
-     * rather than waiting for EWMA settling.
-     *
-     * Gaming relevance:
-     *   hardirq:    mouse click, GPU V-sync, audio DMA completion
-     *   softirq:    network packet (online game), timer (frame cadence)
-     *   ksoftirqd:  deferred bottom-half for the above when load is high
-     *
-     * bpf_in_hardirq/nmi/serving_softirq() are x86 and arm64 only; on
-     * unsupported architectures they always return 0 (correct no-op).
-     *
-     * NOTE: ksoftirqd IS NOT covered by bpf_in_serving_softirq(). That
-     * helper is true only during actual softirq vector execution. ksoftirqd
-     * is a kernel thread that runs softirqs from process context, so its
-     * wakeups appear as normal SCX_WAKE_SYNC or non-sync kthread wakeups.
-     * We check it independently via comm prefix, matching LAVD's
-     * is_ksoftirqd() which uses the same __builtin_memcmp approach. */
-    struct cider_task_ctx *irq_tctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    if (irq_tctx) {
-        bool set_irq_wake = false;
+     * S2: Hoist the three context checks BEFORE the storage lookup.
+     * bpf_in_hardirq/nmi/softirq are pure register queries (~1 cycle each);
+     * bpf_task_storage_get costs ~20 cycles.  On a loaded gaming system the
+     * dominant path is all-CPUs-busy + non-SYNC + no IRQ — the lookup was
+     * pure waste on that path.  Now we only pay for it when we'll use it:
+     *   • IRQ context detected  → need tctx to stamp CAKE_FLOW_IRQ_WAKE
+     *   • SCX_WAKE_SYNC         → dispatch_sync_cold uses tctx as hint
+     *   • idle path (dummy_idle)→ lazy lookup deferred to after dfl call
+     * The all-busy non-SYNC non-IRQ path (dominant under load) never touches
+     * task storage in select_cpu. */
+    bool in_hardirq_or_nmi = bpf_in_hardirq() || bpf_in_nmi();
+    bool in_softirq        = bpf_in_serving_softirq();
+    bool irq_context       = in_hardirq_or_nmi || in_softirq;
 
-        /* FIX (#3): Hoist both kfuncs so each is called at most once.
-         * Previously bpf_in_serving_softirq() was called in both branches of
-         * an if/else-if, meaning it fired twice on the rare
-         * hardirq-while-softirq-pending path.  Hoisting into local bools makes
-         * the single-call guarantee explicit and lets the compiler CSE them. */
-        bool in_hardirq_or_nmi = bpf_in_hardirq() || bpf_in_nmi();
-        bool in_softirq        = bpf_in_serving_softirq();
-
-        if (unlikely(in_hardirq_or_nmi || in_softirq)) {
-            set_irq_wake = true;
-        } else if (!(wake_flags & SCX_WAKE_SYNC)) {
-            /* FIX (#1): ksoftirqd check gated behind non-SYNC wakeups only.
-             *
-             * The old else-branch ran bpf_get_current_task_btf() on EVERY
-             * normal userspace wakeup — the dominant gaming path (input →
-             * game logic → compositor → render) — to answer a question that
-             * is almost never true for user threads.  At 50K–100K wakeups/s
-             * under load this burned ~250K–1M cycles/s/CPU for nothing.
-             *
-             * ksoftirqd wakeups are not SYNC (they originate from process
-             * context, not the waking task's stack), so gating on
-             * !(SCX_WAKE_SYNC) eliminates the kfunc call on the hot SYNC
-             * path with zero change in observable behaviour.
-             *
-             * p is a trusted BTF pointer in STRUCT_OPS context — we can
-             * read waker->comm directly via __builtin_memcmp without going
-             * through bpf_probe_read_kernel.  This is the same technique
-             * used by LAVD's is_ksoftirqd(). */
-            struct task_struct *waker = bpf_get_current_task_btf();
-            if (waker && (waker->flags & PF_KTHREAD) &&
-                __builtin_memcmp(waker->comm, "ksoftirqd/", 10) == 0) {
-                set_irq_wake = true;
-            }
-        }
-
-        if (unlikely(set_irq_wake))
-            __sync_fetch_and_or(&irq_tctx->packed_info,
-                                (u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS);
+    /* ksoftirqd check: only on non-SYNC, non-IRQ paths (same guard as before) */
+    if (!irq_context && !(wake_flags & SCX_WAKE_SYNC)) {
+        struct task_struct *waker = bpf_get_current_task_btf();
+        if (waker && (waker->flags & PF_KTHREAD) &&
+            __builtin_memcmp(waker->comm, "ksoftirqd/", 10) == 0)
+            irq_context = true;
     }
 
     /* Fetch tctx only when a downstream path will consume it */
