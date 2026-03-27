@@ -100,7 +100,12 @@ struct cider_task_ctx {
     /* --- Graduated backoff counter [Bytes 20-21] --- */
     u16 reclass_counter;   /* 2B: Per-task stop counter for per-tier backoff */
 
-    u8 __pad[42];          /* Pad to 64 bytes: 8+8+4+2+42 = 64 */
+    /* S5: consecutive above-1.5×-gate overrun counter.
+     * Incremented in reclassify_task_cold when rt_clamped > 1.5× tier gate.
+     * After 4 consecutive overruns, forces a one-tier demotion regardless of
+     * EWMA, cutting worst-case misclassification from ~128ms to ~8ms. */
+    u8 overrun_count;      /* 1B: consecutive overrun counter */
+    u8 __pad[41];          /* Pad to 64 bytes: 8+8+4+2+1+41 = 64 */
 } __attribute__((aligned(64)));
 
 /* Bitfield layout for packed_info (write-set co-located, Rule 24 mask fusion):

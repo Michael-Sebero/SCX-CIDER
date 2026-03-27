@@ -211,6 +211,7 @@ struct cider_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
     u16 init_deficit = (u16)((quantum_ns + new_flow_bonus_ns) >> 10);
     ctx->last_run_at = 0;
     ctx->reclass_counter = 0;
+    ctx->overrun_count = 0;
 
     /* MULTI-SIGNAL INITIAL CLASSIFICATION
      *
@@ -476,6 +477,15 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
                                 (u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS);
     }
 
+    /* Fetch tctx only when a downstream path will consume it */
+    struct cider_task_ctx *irq_tctx =
+        (irq_context || (wake_flags & SCX_WAKE_SYNC)) ?
+        bpf_task_storage_get(&task_ctx, p, 0, 0) : NULL;
+
+    if (unlikely(irq_context) && irq_tctx)
+        __sync_fetch_and_or(&irq_tctx->packed_info,
+                            (u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS);
+
     /* SYNC FAST PATH: Direct dispatch to waker's CPU.
      * Pass irq_tctx already obtained above — dispatch_sync_cold reuses it
      * directly, saving one bpf_task_storage_get (~20c) on this hot path.
@@ -492,12 +502,12 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
     s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &scr->dummy_idle);
 
     if (scr->dummy_idle) {
-        /* Kernel found & claimed an idle CPU — direct dispatch.
-         * cider_enqueue will NOT run on this path, so we must consume
-         * CAKE_FLOW_IRQ_WAKE here if set — same as dispatch_sync_cold.
-         * Use tier-adjusted slice so kernel preemption matches tick's check.
-         * Reuse irq_tctx already obtained above — no third storage lookup. */
-        struct cider_task_ctx *tctx = irq_tctx;
+        /* S2 lazy lookup: tctx was skipped above on non-IRQ non-SYNC paths.
+         * Fetch it now that we know we're on the direct-dispatch path and
+         * need the task's actual tier + slice.  If already fetched (IRQ path),
+         * reuse it — no second lookup. */
+        struct cider_task_ctx *tctx = irq_tctx ?
+            irq_tctx : bpf_task_storage_get(&task_ctx, p, 0, 0);
 
         /* Shared helper handles flag consumption, stats, and NULL-tctx fallback. */
         u64 slice;
@@ -786,10 +796,16 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
         u32 best_cpu    = CAKE_MAX_CPUS;  /* sentinel: no victim found */
         u8  worst_tier  = CAKE_TIER_INTERACT; /* only displace T2 or T3 */
 
-        for (u32 c = 0; c < nr_cpus; c++) {
-            if (cpu_llc_id[c & (CAKE_MAX_CPUS - 1)] != enq_llc)
+        /* S6: start scan at enq_cpu rather than 0.
+         * When multiple T0 IRQs fire simultaneously (audio DMA + GPU vsync
+         * + network), each fires on a different enq_cpu, so concurrent scans
+         * naturally spread their kick targets across the LLC.  Cost: one AND
+         * per iteration replacing one compare — identical to before. */
+        for (u32 i = 0; i < nr_cpus; i++) {
+            u32 c = (enq_cpu + i) & (CAKE_MAX_CPUS - 1);
+            if (cpu_llc_id[c] != enq_llc)
                 continue;
-            u8 mf = cider_relaxed_load_u8(&mega_mailbox[c & (CAKE_MAX_CPUS - 1)].flags);
+            u8 mf = cider_relaxed_load_u8(&mega_mailbox[c].flags);
             u8 ct = MBOX_GET_TIER(mf);
             if (ct > worst_tier) {
                 worst_tier = ct;
@@ -1070,6 +1086,19 @@ static const u16 tier_gate_promote[3] = {
     TIER_GATE_T2 - TIER_GATE_T2 / 10,   /* 7200 */
 };
 
+/* S5: 1.5× tier-gate overrun thresholds.
+ * A task consistently exceeding its tier gate by 50% on 4 consecutive bouts
+ * triggers an immediate forced demotion, cutting worst-case misclassification
+ * from ~128ms (EWMA slow-demote path) to ~8ms.  1.5× rather than 1.0× avoids
+ * false-triggering on normal EWMA bounce near the boundary.  T3 entry is 0:
+ * bulk tasks have no gate to exceed. */
+static const u16 tier_overrun_gate[4] = {
+    TIER_GATE_T0 + TIER_GATE_T0 / 2,   /* T0: 150µs  */
+    TIER_GATE_T1 + TIER_GATE_T1 / 2,   /* T1: 3000µs */
+    TIER_GATE_T2 + TIER_GATE_T2 / 2,   /* T2: 12000µs */
+    0,                                   /* T3: no check */
+};
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * AVG_RUNTIME CLASSIFICATION + DRR++: Dynamic tier reclassification on every stop.
  * CPU analog of network CAKE's flow classification:
@@ -1262,6 +1291,30 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
      * a single anomalous 25ms burst won't cause premature demotion. */
     if (new_avg > (u16)(TIER_GATE_T2 * 3) && stable >= 3 && new_tier < CAKE_TIER_BULK)
         new_tier = CAKE_TIER_BULK;
+
+    /* ── S5: CONSECUTIVE OVERRUN DEMOTION ──
+     * If rt_clamped has exceeded 1.5× the tier gate for 4 consecutive bouts,
+     * force-demote by one tier even if the EWMA hasn't crossed the gate yet.
+     * Resets the counter and stability on any forced demotion.
+     * Only checked for T0–T2; T3 tasks are already bulk. */
+    if (old_tier < CAKE_TIER_BULK) {
+        u16 og = tier_overrun_gate[CAKE_TIER_IDX(old_tier)];
+        if (rt_clamped > og) {
+            u8 oc = tctx->overrun_count + 1;
+            if (oc >= 4) {
+                u8 forced = (old_tier < CAKE_TIER_BULK) ?
+                    (u8)(old_tier + 1) : (u8)CAKE_TIER_BULK;
+                if (new_tier < forced)
+                    new_tier = forced;
+                tctx->overrun_count = 0;
+                stable = 0;  /* reset so new_stable below starts from 0 */
+            } else {
+                tctx->overrun_count = oc;
+            }
+        } else {
+            tctx->overrun_count = 0;
+        }
+    }
 
     /* ── WRITE PACKED_INFO (MESI-friendly: skip if unchanged) ── */
     bool tier_changed = (new_tier != old_tier);
