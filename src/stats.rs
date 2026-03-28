@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Statistics module for scx_cider - utilities for reading/formatting scheduler stats from BPF maps
+// Statistics module for scx_imperator - utilities for reading/formatting scheduler stats from BPF maps
 
 /// Priority tier names (4-tier system classified by avg_runtime)
 pub const TIER_NAMES: [&str; 4] = [

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* scx_cider BPF/userspace interface - shared data structures and constants */
+/* scx_imperator BPF/userspace interface - shared data structures and constants */
 
 #ifndef __CAKE_INTF_H
 #define __CAKE_INTF_H
@@ -18,7 +18,7 @@ typedef signed long s64;
 #endif
 
 /* CAKE TIER SYSTEM — 4-tier classification by avg_runtime */
-enum cider_tier {
+enum imperator_tier {
     CAKE_TIER_CRITICAL  = 0,  /* <100µs:  IRQ, input, audio, network */
     CAKE_TIER_INTERACT  = 1,  /* <2ms:    compositor, physics, AI */
     CAKE_TIER_FRAME     = 2,  /* <8ms:    game render, encoding */
@@ -38,15 +38,15 @@ _Static_assert(CAKE_TIER_MAX <= 8,
 #define CAKE_ETD_CROSS_LLC_THRESHOLD 5
 
 /* FLOW STATE FLAGS */
-enum cider_flow_flags {
+enum imperator_flow_flags {
     CAKE_FLOW_NEW         = 1 << 0,
     CAKE_FLAG_LOCK_HOLDER = 1 << 1,
     CAKE_FLOW_IRQ_WAKE    = 1 << 2,
 };
 
 /* Per-task flow state — 64B, one cache line */
-struct cider_task_ctx {
-    /* Hot write group (cider_stopping) [Bytes 0-15] */
+struct imperator_task_ctx {
+    /* Hot write group (imperator_stopping) [Bytes 0-15] */
     u64 next_slice;
 
     union {
@@ -63,13 +63,15 @@ struct cider_task_ctx {
         u64 state_fused_u64;
     };
 
-    /* Timestamp (cider_running) [Bytes 16-19] */
+    /* Timestamp (imperator_running) [Bytes 16-19] */
     u32 last_run_at;
 
     /* Graduated backoff counter [Bytes 20-21] */
     u16 reclass_counter;
 
     /* S5: overrun_count — 8-bit shift register of execution outcomes.
+     *
+     * IMPLEMENTED AS: bit-history shift register (imperator_bpf.c [H] s6).
      *
      * SEMANTICS: Each stop, the register shifts left one position and the
      * current bout's result is inserted in the LSB.  The oldest result falls
@@ -81,7 +83,7 @@ struct cider_task_ctx {
      * DEMOTION TRIGGER: __builtin_popcount(overrun_count) >= 4
      *   Fires when 4 of the last 8 bouts exceeded the gate.
      *
-     * BEHAVIORAL EQUIVALENCE TO ORIGINAL CONSECUTIVE COUNTER:
+     * BEHAVIORAL SUPERSET OF ORIGINAL CONSECUTIVE COUNTER:
      *   4 consecutive overruns → hist = 0b00001111 → popcount = 4 ≥ 4 → DEMOTE
      *   This is identical to the original counter-based trigger at N=4.
      *
@@ -93,19 +95,38 @@ struct cider_task_ctx {
      * This change is strictly a superset of the original: every pattern that
      * triggered before still triggers; additional patterns now also trigger.
      *
-     * INIT VALUE: 0 (empty history) — correct for alloc_task_ctx_cold.
+     * THRESHOLD: 4 (not 5 — threshold 5 was a regression: 4 consecutive
+     * overruns → popcount=4 < 5 → no demotion, breaking parity with the
+     * original consecutive counter that fired at exactly 4).
+     *
+     * INIT VALUE: 0 (empty history, no overruns observed) — set explicitly
+     * by alloc_task_ctx_cold; also reset on exec in imperator_init_task.
      * FIELD NAME: kept as `overrun_count` to avoid disrupting external tools;
      *             the type (u8) and offset (byte 22) are unchanged.
      * NO STRUCT SIZE CHANGE: __pad[39] is unchanged. */
     u8 overrun_count;
 
     u8 lock_skip_count;
+
+    /* pending_futex_op — tracepoint fallback op storage (lock_bpf.c).
+     *
+     * Stores the futex op recorded at sys_enter_futex so sys_exit_futex can
+     * act on it even if the task migrated CPUs while sleeping (blocking futex
+     * variants park the task inside the kernel and may wake it on a different
+     * CPU from where it entered).
+     *
+     * INIT VALUE: CAKE_FUTEX_OP_UNSET (0xFF) — written explicitly by
+     * alloc_task_ctx_cold.  BPF task-storage zero-initialises new entries
+     * (giving 0 == CAKE_FUTEX_WAIT), which would cause a false set_lock_holder()
+     * on the first sys_exit_futex(ret=0) before any sys_enter_futex is observed.
+     * The explicit 0xFF init makes the UNSET guard in imperator_tp_exit_futex safe
+     * from the very first syscall. */
     u8 pending_futex_op;
     u8 __pad[39];
 } __attribute__((aligned(64)));
 
-_Static_assert(sizeof(struct cider_task_ctx) == 64,
-    "cider_task_ctx must be exactly 64B (one cache line) — update __pad if fields change");
+_Static_assert(sizeof(struct imperator_task_ctx) == 64,
+    "imperator_task_ctx must be exactly 64B (one cache line) — update __pad if fields change");
 
 /* packed_info bitfield layout:
  * [Stable:2][Tier:2][Flags:4][Rsvd:8][Wait:8][Error:8]
@@ -136,13 +157,17 @@ _Static_assert(sizeof(struct cider_task_ctx) == 64,
 
 struct mega_mailbox_entry {
     u8 flags;
+    /* dsq_hint: DVFS perf-target hysteresis cache (u8 = cpuperf_target >> 2).
+     * Name is historical (original use was DSQ selection hint, now removed);
+     * the field stores the last written DVFS target to skip redundant kfunc
+     * calls when the tier has not changed between ticks. */
     u8 dsq_hint;
     u8 tick_counter;
     u8 __reserved[61];
 } __attribute__((aligned(64)));
 
 /* Statistics */
-struct cider_stats {
+struct imperator_stats {
     u64 nr_new_flow_dispatches;
     u64 nr_old_flow_dispatches;
     u64 nr_tier_dispatches[CAKE_TIER_MAX];

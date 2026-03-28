@@ -22,13 +22,13 @@ use ratatui::{
 };
 use tachyonfx::{fx, EffectManager};
 
-use crate::bpf_skel::types::cider_stats;
+use crate::bpf_skel::types::imperator_stats;
 use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
 use crate::topology::TopologyInfo;
 
-fn aggregate_stats(skel: &BpfSkel) -> cider_stats {
-    let mut total: cider_stats = Default::default();
+fn aggregate_stats(skel: &BpfSkel) -> imperator_stats {
+    let mut total: imperator_stats = Default::default();
 
     if let Some(bss) = &skel.maps.bss_data {
         for s in &bss.global_stats {
@@ -57,7 +57,7 @@ pub struct TuiApp {
     status_message: Option<(String, Instant)>,
     topology: TopologyInfo,
     /// Snapshot taken at the previous tick — used to compute per-second rates.
-    prev_stats: cider_stats,
+    prev_stats: imperator_stats,
     /// Wall-clock time of the previous snapshot, used for delta-time divisor.
     prev_tick: Instant,
 }
@@ -77,7 +77,7 @@ impl TuiApp {
             start_time: Instant::now(),
             status_message: None,
             topology,
-            prev_stats: cider_stats::default(),
+            prev_stats: imperator_stats::default(),
             prev_tick: Instant::now(),
         }
     }
@@ -89,7 +89,7 @@ impl TuiApp {
     /// Handles counter resets (the `[r]` key zeroes BSS): when a new value is less
     /// than the previous, the delta is clamped to zero for that field rather than
     /// producing a large negative or wrap-around spike.
-    pub fn tick_stats(&mut self, current: &cider_stats) -> StatsRates {
+    pub fn tick_stats(&mut self, current: &imperator_stats) -> StatsRates {
         let elapsed_secs = self.prev_tick.elapsed().as_secs_f64().max(0.001);
 
         let delta = |cur: u64, prev: u64| -> f64 {
@@ -119,7 +119,7 @@ impl TuiApp {
     /// produces a fresh window rather than a misleading spike.  Called when
     /// the user resets BSS counters with `[r]`.
     pub fn invalidate_rates(&mut self) {
-        self.prev_stats = cider_stats::default();
+        self.prev_stats = imperator_stats::default();
         self.prev_tick  = Instant::now();
     }
 
@@ -455,7 +455,7 @@ fn render_startup_widgets(
         Line::from(vec![
             Span::styled(" 🍰 ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                "scx_cider ",
+                "scx_imperator ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -888,7 +888,7 @@ impl<'a> Widget for LatencyTable<'a> {
 }
 
 /// Format stats as a copyable text string
-fn format_stats_for_clipboard(stats: &cider_stats, uptime: &str) -> String {
+fn format_stats_for_clipboard(stats: &imperator_stats, uptime: &str) -> String {
     let total_dispatches = stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches;
     let new_pct = if total_dispatches > 0 {
         (stats.nr_new_flow_dispatches as f64 / total_dispatches as f64) * 100.0
@@ -898,7 +898,7 @@ fn format_stats_for_clipboard(stats: &cider_stats, uptime: &str) -> String {
 
     let mut output = String::new();
     output.push_str(&format!(
-        "=== scx_cider Statistics (Uptime: {}) ===\n\n",
+        "=== scx_imperator Statistics (Uptime: {}) ===\n\n",
         uptime
     ));
     output.push_str(&format!(
@@ -924,7 +924,7 @@ fn format_stats_for_clipboard(stats: &cider_stats, uptime: &str) -> String {
 }
 
 /// Draw the UI
-fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats, rates: &StatsRates) {
+fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &imperator_stats, rates: &StatsRates) {
     let area = frame.area();
 
     // Create main layout: header, stats table, footer
@@ -976,7 +976,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cider_stats, rates: &StatsRa
     );
     let header = Paragraph::new(header_text).block(
         Block::default()
-            .title(" scx_cider Statistics ")
+            .title(" scx_imperator Statistics ")
             .title_style(
                 Style::default()
                     .fg(Color::Cyan)

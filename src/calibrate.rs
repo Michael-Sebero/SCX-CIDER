@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// ETD for scx_cider - measures inter-core latency via CAS ping-pong (adapted from nviennot/core-to-core-latency)
+// ETD for scx_imperator - measures inter-core latency via CAS ping-pong (adapted from nviennot/core-to-core-latency)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};

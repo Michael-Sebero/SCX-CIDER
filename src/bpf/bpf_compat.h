@@ -1,4 +1,4 @@
-/* scx_cider/bpf/bpf_compat.h */
+/* scx_imperator/bpf/bpf_compat.h */
 #ifndef __CAKE_BPF_COMPAT_H
 #define __CAKE_BPF_COMPAT_H
 
@@ -7,12 +7,12 @@
 #if defined(__clang__) && __clang_major__ >= 21
 
     /* MODERN PATH: Formal Atomics (Max Performance) */
-    #define cider_relaxed_load_u8(ptr)       __atomic_load_n(ptr, __ATOMIC_RELAXED)
-    #define cider_relaxed_store_u8(ptr, v)   __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
-    #define cider_relaxed_load_u32(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
-    #define cider_relaxed_store_u32(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
-    #define cider_relaxed_load_u64(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
-    #define cider_relaxed_store_u64(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
+    #define imperator_relaxed_load_u8(ptr)       __atomic_load_n(ptr, __ATOMIC_RELAXED)
+    #define imperator_relaxed_store_u8(ptr, v)   __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
+    #define imperator_relaxed_load_u32(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
+    #define imperator_relaxed_store_u32(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
+    #define imperator_relaxed_load_u64(ptr)      __atomic_load_n(ptr, __ATOMIC_RELAXED)
+    #define imperator_relaxed_store_u64(ptr, v)  __atomic_store_n(ptr, v, __ATOMIC_RELAXED)
 
 #else
 
@@ -23,12 +23,12 @@
      * member assignment is not guaranteed to be atomic or visible to other CPUs
      * without these wrappers, which is a data race under the C11 memory model.
      * Used for mega_mailbox u8 fields (flags, dsq_hint, tick_counter) that are
-     * written by the owning CPU in cider_tick and read by other CPUs in cider_enqueue
+     * written by the owning CPU in imperator_tick and read by other CPUs in imperator_enqueue
      * (waker-tier inheritance).  RELAXED semantics are sufficient here: no ordering
      * with respect to surrounding memory operations is required — visibility alone
      * is the goal.  __ATOMIC_RELAXED maps to a plain MOV on both x86 and ARM64;
      * the "m"(*ptr) memory operand tells the compiler the location is live. */
-    static __always_inline u8 cider_relaxed_load_u8(const volatile u8 *ptr) {
+    static __always_inline u8 imperator_relaxed_load_u8(const volatile u8 *ptr) {
         u8 val;
         asm volatile(
             "%0 = *(u8 *)(%1 + 0)"
@@ -38,7 +38,7 @@
         return val;
     }
 
-    static __always_inline void cider_relaxed_store_u8(volatile u8 *ptr, u8 val) {
+    static __always_inline void imperator_relaxed_store_u8(volatile u8 *ptr, u8 val) {
         asm volatile(
             "*(u8 *)(%1 + 0) = %2"
             : "=m"(*ptr)
@@ -46,7 +46,7 @@
         );
     }
 
-    static __always_inline u32 cider_relaxed_load_u32(const volatile u32 *ptr) {
+    static __always_inline u32 imperator_relaxed_load_u32(const volatile u32 *ptr) {
         u32 val;
         asm volatile(
             "%0 = *(u32 *)(%1 + 0)"
@@ -56,7 +56,7 @@
         return val;
     }
 
-    static __always_inline void cider_relaxed_store_u32(volatile u32 *ptr, u32 val) {
+    static __always_inline void imperator_relaxed_store_u32(volatile u32 *ptr, u32 val) {
         asm volatile(
             "*(u32 *)(%1 + 0) = %2"
             : "=m"(*ptr)           /* Only this address modified */
@@ -64,7 +64,7 @@
         );
     }
 
-    static __always_inline u64 cider_relaxed_load_u64(const volatile u64 *ptr) {
+    static __always_inline u64 imperator_relaxed_load_u64(const volatile u64 *ptr) {
         u64 val;
         asm volatile(
             "%0 = *(u64 *)(%1 + 0)"
@@ -74,7 +74,7 @@
         return val;
     }
 
-    static __always_inline void cider_relaxed_store_u64(volatile u64 *ptr, u64 val) {
+    static __always_inline void imperator_relaxed_store_u64(volatile u64 *ptr, u64 val) {
         asm volatile(
             "*(u64 *)(%1 + 0) = %2"
             : "=m"(*ptr)
@@ -92,7 +92,7 @@
 
 /* BIT SCAN FORWARD (CTZ): Clang <19 fallback uses De Bruijn to avoid opcode 191 crash */
 #if defined(__clang__) && __clang_major__ < 19
-    static __always_inline u32 cider_ctz64(u64 mask, u64 mult) {
+    static __always_inline u32 imperator_ctz64(u64 mask, u64 mult) {
         static const u8 de_bruijn_bits[64] = {
             0,  1,  2, 53,  3,  7, 54, 27, 4, 38, 41,  8, 34, 55, 48, 28,
             62, 5, 39, 46, 44, 42, 22,  9, 24, 35, 59, 56, 49, 18, 29, 11,
@@ -117,18 +117,18 @@
 
         return de_bruijn_bits[product >> 58];
     }
-    #define BIT_SCAN_FORWARD_U64(mask) cider_ctz64(mask, 0x022FDD63CC95386DULL)
+    #define BIT_SCAN_FORWARD_U64(mask) imperator_ctz64(mask, 0x022FDD63CC95386DULL)
 
     /* FIX (#15): U32-specific BSF using De Bruijn sequence for 32-bit masks.
      * Avoids zero-extending u32 into the 64-bit De Bruijn table which uses a
      * 64-bit multiplier — correct by accident but semantically wrong. */
-    static __always_inline u32 cider_ctz32(u32 mask) {
+    static __always_inline u32 imperator_ctz32(u32 mask) {
         static const u8 de_bruijn32[32] = {
             0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
             31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
         };
         u32 lsb = mask & (u32)(-(s32)mask);
-        /* FIX (barrier-placement): Barrier after the multiply — see cider_ctz64
+        /* FIX (barrier-placement): Barrier after the multiply — see imperator_ctz64
          * comment.  Materialises the product register before the peephole window,
          * preventing Clang 18 post-RA from recovering the De Bruijn sequence and
          * substituting __builtin_ctz (which emits opcode 191 on older JITs). */
@@ -136,7 +136,7 @@
         asm volatile("" : "+r"(product));
         return de_bruijn32[product >> 27];
     }
-    #define BIT_SCAN_FORWARD_U32(mask) cider_ctz32(mask)
+    #define BIT_SCAN_FORWARD_U32(mask) imperator_ctz32(mask)
 #else
     #define BIT_SCAN_FORWARD_U64(mask) __builtin_ctzll(mask)
     /* FIX (#15): Use __builtin_ctz for u32 operands (correct width, avoids implicit widening) */
@@ -159,7 +159,7 @@
  * kernel doesn't export it. A __weak redeclaration CANNOT override the strong
  * one already seen from common.bpf.h. Until the scx team makes it __weak or
  * all kernels export it, we use cpu_rq. */
-static __always_inline struct rq *cider_get_rq(s32 cpu) {
+static __always_inline struct rq *imperator_get_rq(s32 cpu) {
     return scx_bpf_cpu_rq(cpu);
 }
 

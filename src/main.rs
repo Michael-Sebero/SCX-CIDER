@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// scx_cider - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
+// scx_imperator - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
 
 mod calibrate;
 mod stats;
@@ -106,7 +106,7 @@ impl Profile {
     }
 }
 
-/// 🍰 scx_cider: A sched_ext scheduler applying CAKE bufferbloat concepts
+/// 🍰 scx_imperator: A sched_ext scheduler applying CAKE bufferbloat concepts
 ///
 /// 4-TIER SYSTEM (classified by avg_runtime):
 ///   T0 Critical  (<100µs): IRQ, input, audio, network
@@ -114,7 +114,7 @@ impl Profile {
 ///   T2 Frame     (<8ms):   game render, encoding
 ///   T3 Bulk      (≥8ms):   compilation, background
 #[derive(Parser, Debug)]
-#[command(author, version, about = "🍰 scx_cider scheduler", verbatim_doc_comment)]
+#[command(author, version, about = "🍰 scx_imperator scheduler", verbatim_doc_comment)]
 struct Args {
     #[arg(long, short, value_enum, default_value_t = Profile::Gaming)]
     profile: Profile,
@@ -258,7 +258,7 @@ impl<'a> Scheduler<'a> {
                 rodata.cpu_llc_id[i] = llc_id as u32;
             }
             // NOTE: llc_cpu_mask is NOT written from Rust.
-            // cider_init (BPF side) computes it from cpu_llc_id at scheduler
+            // imperator_init (BPF side) computes it from cpu_llc_id at scheduler
             // attachment time — before any task is scheduled.  This eliminates
             // the partial-deploy hazard where a missing write left the mask
             // all-zeros, causing silent kick failures.
@@ -273,7 +273,7 @@ impl<'a> Scheduler<'a> {
         let _link = self
             .skel
             .maps
-            .cider_ops
+            .imperator_ops
             .attach_struct_ops()
             .context("Failed to attach scheduler")?;
 
@@ -391,7 +391,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        info!("scx_cider scheduler shutting down");
+        info!("scx_imperator scheduler shutting down");
         Ok(())
     }
 

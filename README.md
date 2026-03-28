@@ -1,1 +1,1 @@
-Context-aware · Interrupt-sensitive · Deficit-round-robin · Execution-optimized · Router
+Integrated Multitiered Priority Execution Ranked Adaptive Topology Ordered Runtime

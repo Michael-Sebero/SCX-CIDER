@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* scx_cider - CAKE DRR++ adapted for CPU scheduling: avg_runtime classification, direct dispatch, tiered DSQ */
+/* scx_imperator - CAKE DRR++ adapted for CPU scheduling: avg_runtime classification, direct dispatch, tiered DSQ */
 
 #include <scx/common.bpf.h>
 #include <scx/compat.bpf.h>
@@ -24,6 +24,17 @@ const u32 nr_llcs = 1;
 const u32 nr_cpus = 8;  /* Set by loader — bounds kick scan loop (Rule 39) */
 const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
 
+/* [A] llc_cpu_mask — BSS, computed by imperator_init from cpu_llc_id RODATA.
+ *
+ * Writable at BPF runtime; guaranteed non-zero for any LLC with ≥1 CPU before
+ * the first task is scheduled.  Eliminates the partial-deploy hazard where a
+ * missing Rust-side write left the mask all-zeros and the O(1) bitmask kick
+ * path silently produced zero kicks without any error or warning.
+ *
+ * LAYOUT: 8 × 8B = 64B, one cache line.  Read in imperator_enqueue: one miss
+ * loads the entire array.  Read-only after imperator_init completes. */
+u64 llc_cpu_mask[CAKE_MAX_LLCS] SEC(".bss") __attribute__((aligned(64)));
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * MEGA-MAILBOX: 64-byte per-CPU state (single cache line = optimal L1)
  * - Zero false sharing: each CPU writes ONLY to mega_mailbox[its_cpu]
@@ -41,7 +52,7 @@ struct mega_mailbox_entry mega_mailbox[CAKE_MAX_CPUS] SEC(".bss");
  * unnecessary coherence traffic per enqueue (~1% overhead at peak).
  *
  * New design: each LLC writes ONLY its own entry.  Other LLCs read entries
- * they do not own only during the steal scan in cider_dispatch, which is an
+ * they do not own only during the steal scan in imperator_dispatch, which is an
  * infrequent (drain) event.  Cross-LLC coherence traffic is eliminated on the
  * hot enqueue path and reduced to at most (nr_llcs - 1) reads on drain.
  *
@@ -58,18 +69,39 @@ struct {
 } __attribute__((aligned(64))) llc_nonempty[CAKE_MAX_LLCS] SEC(".bss")
     __attribute__((aligned(64)));
 
+/* [B] tier_cpu_mask — per-tier bitmask of CPUs currently running tasks of that tier.
+ *
+ * INVARIANT: bit i of tier_cpu_mask[t] is set iff CPU i is currently running a
+ * task whose EWMA tier is t.
+ *
+ * Responsibility split (no double-ownership):
+ *   imperator_running  → sets   bit for the new task's tier  (never clears)
+ *   imperator_stopping → clears bit for the stopping tier    (never sets)
+ *                    MUST clear BEFORE reclassify_task_cold() so that
+ *                    GET_TIER(tctx) still returns the running-time tier, not
+ *                    the post-EWMA tier.
+ *
+ * CONCURRENCY: __sync_fetch_and_or / __sync_fetch_and_and map to BPF_ATOMIC_OR /
+ * BPF_ATOMIC_AND (single instruction, not a CAS loop).  No two CPUs write the
+ * same bit simultaneously (each CPU owns its own bit = 1ULL << cpu_id).
+ *
+ * LAYOUT: 4 × 8B = 32B.  All four tier words share one 64B cache line with
+ * llc_cpu_mask when the allocator places them adjacently — both are loaded on
+ * the T0/T1 kick path.  CAKE_TIER_MAX = 4 so the alignment covers the array. */
+u64 tier_cpu_mask[CAKE_TIER_MAX] SEC(".bss") __attribute__((aligned(64)));
+
 /* Helper: mark an LLC's DSQ as non-empty.  Skip the store when already set to
  * avoid a needless write to a hot cache line on every enqueue. */
 static __always_inline void llc_mark_nonempty(u32 llc_id)
 {
     u32 idx = llc_id & (CAKE_MAX_LLCS - 1);
-    if (!cider_relaxed_load_u8(&llc_nonempty[idx].nonempty))
-        cider_relaxed_store_u8(&llc_nonempty[idx].nonempty, 1);
+    if (!imperator_relaxed_load_u8(&llc_nonempty[idx].nonempty))
+        imperator_relaxed_store_u8(&llc_nonempty[idx].nonempty, 1);
 }
 
 /* Metadata accessors (Fused layout) */
 #define GET_TIER_RAW(packed) EXTRACT_BITS_U32(packed, SHIFT_TIER, 2)
-#define GET_TIER(ctx) GET_TIER_RAW(cider_relaxed_load_u32(&(ctx)->packed_info))
+#define GET_TIER(ctx) GET_TIER_RAW(imperator_relaxed_load_u32(&(ctx)->packed_info))
 
 /* Per-CPU scratch area - BSS-tunneled helper outputs, isolated to prevent MESI contention.
  *
@@ -78,18 +110,18 @@ static __always_inline void llc_mark_nonempty(u32 llc_id)
  * init_tier is a local variable in alloc_task_ctx_cold, not a scratch field.
  * Together they consumed ~79B of the 128B line (4.8 KB across 64 CPUs) and
  * forced false-sharing through the iterator's alignment requirements. */
-struct cider_scratch {
+struct imperator_scratch {
     bool dummy_idle;            /* 1B: idle flag from scx_bpf_select_cpu_dfl */
     u8   _pad0[3];              /* Align cached_llc to u32 boundary */
     u32  cached_llc;            /* 4B: LLC ID tunneled from select_cpu → enqueue (saves 1 kfunc) */
     u64  cached_now;            /* 8B: scx_bpf_now() tunneled from select_cpu → enqueue (saves 1 kfunc) */
     u8   _pad[112];             /* Pad to 128B (2 cache lines): 1+3+4+8+112 = 128 */
 } global_scratch[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligned(128)));
-_Static_assert(sizeof(struct cider_scratch) == 128,
-    "cider_scratch must be exactly 128B (2 cache lines) -- update _pad if fields change");
+_Static_assert(sizeof(struct imperator_scratch) == 128,
+    "imperator_scratch must be exactly 128B (2 cache lines) -- update _pad if fields change");
 
 /* Global stats BSS array - 0ns lookup vs 25ns helper, 256-byte aligned per CPU */
-struct cider_stats global_stats[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligned(256)));
+struct imperator_stats global_stats[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligned(256)));
 
 /* BSS tail guard - absorbs BTF truncation bugs instead of corrupting real data */
 u8 __bss_tail_guard[64] SEC(".bss") __attribute__((aligned(64)));
@@ -108,7 +140,7 @@ u8 llc_etd_cost[CAKE_MAX_LLCS][CAKE_MAX_LLCS] SEC(".bss")
  * to scx_bpf_select_cpu_dfl() which uses the kernel's authoritative idle
  * tracking (zero staleness, atomic claiming). */
 
-static __always_inline struct cider_stats *get_local_stats(void)
+static __always_inline struct imperator_stats *get_local_stats(void)
 {
     u32 cpu = bpf_get_smp_processor_id();
     return &global_stats[cpu & (CAKE_MAX_CPUS - 1)];
@@ -181,7 +213,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
-    __type(value, struct cider_task_ctx);
+    __type(value, struct imperator_task_ctx);
 } task_ctx SEC(".maps");
 
 /* Bitfield accessors - relaxed atomics prevent tearing */
@@ -201,16 +233,16 @@ _Static_assert(SHIFT_TIER == SHIFT_FLAGS + 4,
 
 /* perform_lazy_accounting removed - accounting in tick */
 
-/* init_new_kthread_cold inlined into cider_enqueue — reuses hoisted
+/* init_new_kthread_cold inlined into imperator_enqueue — reuses hoisted
  * now_cached + enq_llc, saving 2 kfunc calls per kthread enqueue. */
 
 /* select_cpu_new_task_cold removed — new tasks go through the same
  * scx_bpf_select_cpu_dfl path as all other tasks. */
 
 static __attribute__((noinline))
-struct cider_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
+struct imperator_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
 {
-    struct cider_task_ctx *ctx;
+    struct imperator_task_ctx *ctx;
 
     /* Heavy allocator call */
     ctx = bpf_task_storage_get(&task_ctx, p, 0,
@@ -222,6 +254,21 @@ struct cider_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
     ctx->last_run_at = 0;
     ctx->reclass_counter = 0;
     ctx->overrun_count = 0;
+    ctx->lock_skip_count = 0;
+
+    /* FIX (C-2): Initialise pending_futex_op to CAKE_FUTEX_OP_UNSET (0xFF).
+     *
+     * BPF task-storage zero-initialises new entries, giving pending_futex_op
+     * the value 0 == CAKE_FUTEX_WAIT.  The guard in imperator_tp_exit_futex only
+     * returns early when pending_futex_op == 0xFF (UNSET); with 0 it falls
+     * through to the switch-case and calls set_lock_holder() for any
+     * sys_exit_futex with ret==0 — including tasks whose first kernel event
+     * is a successful futex return before any sys_enter_futex was observed.
+     *
+     * Writing 0xFF here makes the UNSET guard unconditionally safe: the field
+     * stays 0xFF until imperator_tp_enter_futex records a real op, and the exit
+     * handler skips cleanly until then. */
+    ctx->pending_futex_op = CAKE_FUTEX_OP_UNSET;
 
     /* MULTI-SIGNAL INITIAL CLASSIFICATION
      *
@@ -302,9 +349,9 @@ struct cider_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
 }
 
 /* Get/init task context - hot path: fast lookup only, cold path: noinline alloc */
-static __always_inline struct cider_task_ctx *get_task_ctx(struct task_struct *p, bool create)
+static __always_inline struct imperator_task_ctx *get_task_ctx(struct task_struct *p, bool create)
 {
-    struct cider_task_ctx *ctx;
+    struct imperator_task_ctx *ctx;
 
     /* Fast path: lookup existing context */
     ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
@@ -323,7 +370,7 @@ static __always_inline struct cider_task_ctx *get_task_ctx(struct task_struct *p
 
 /* T0 victim cold path removed — when all CPUs are busy, tasks go through
  * enqueue → per-LLC DSQ where vtime ordering ensures T0 tasks get pulled
- * first. Preemption handled by cider_tick starvation checks. */
+ * first. Preemption handled by imperator_tick starvation checks. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * KERNEL-FIRST FLAT SELECT_CPU: ~20 instructions vs ~200+ in the old cascade.
@@ -331,7 +378,7 @@ static __always_inline struct cider_task_ctx *get_task_ctx(struct task_struct *p
  * Architecture: delegate idle detection to the kernel's authoritative
  * scx_bpf_select_cpu_dfl() which does prev → sibling → LLC cascade internally
  * with zero staleness and atomic claiming. When all CPUs are busy, return
- * prev_cpu and let cider_enqueue handle via per-LLC DSQ with vtime ordering.
+ * prev_cpu and let imperator_enqueue handle via per-LLC DSQ with vtime ordering.
  *
  * Benefits (tier-agnostic by design — all tiers equally important):
  * - All tiers 0-3 take the same placement path (tiers define latency, not affinity)
@@ -343,28 +390,28 @@ static __always_inline struct cider_task_ctx *get_task_ctx(struct task_struct *p
 /* ── SHARED HELPER: IRQ-wake flag consumption ───────────────────────────────
  * Centralises the CAKE_FLOW_IRQ_WAKE one-shot flag consumption that previously
  * appeared identically in both dispatch_sync_cold and the dummy_idle branch of
- * cider_select_cpu.  Keeping two copies risked them drifting apart silently.
+ * imperator_select_cpu.  Keeping two copies risked them drifting apart silently.
  *
  * Consumes the flag atomically if set, writes the T0 slice to *slice_out, and
  * returns CAKE_TIER_CRITICAL.  If not set, passes through next_slice and the
  * task's current tier.  If tctx is NULL (task not yet classified), defaults to
  * quantum_ns + CAKE_TIER_INTERACT — safe for unclassified tasks on idle CPUs.
  *
- * Called only from direct-dispatch paths (SCX_DSQ_LOCAL_ON) where cider_enqueue
+ * Called only from direct-dispatch paths (SCX_DSQ_LOCAL_ON) where imperator_enqueue
  * will NOT run to consume the flag; leaving it set would cause a stale T0 boost
  * on the task's next wakeup. */
 static __always_inline u8
-consume_irq_wake_get_tier_slice(struct cider_task_ctx *tctx, u64 *slice_out)
+consume_irq_wake_get_tier_slice(struct imperator_task_ctx *tctx, u64 *slice_out)
 {
     if (tctx) {
-        u32 packed = cider_relaxed_load_u32(&tctx->packed_info);
+        u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
         if (unlikely(packed & ((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS))) {
             __sync_fetch_and_and(&tctx->packed_info,
                                  ~((u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS));
             u64 cfg = tier_configs[CAKE_TIER_IDX(CAKE_TIER_CRITICAL)];
             *slice_out = (quantum_ns * UNPACK_MULTIPLIER(cfg)) >> 10;
             if (enable_stats) {
-                struct cider_stats *s = get_local_stats();
+                struct imperator_stats *s = get_local_stats();
                 if (s) s->nr_irq_wake_boosts++;
             }
             return CAKE_TIER_CRITICAL;
@@ -379,7 +426,7 @@ consume_irq_wake_get_tier_slice(struct cider_task_ctx *tctx, u64 *slice_out)
 /* SYNC fast-path dispatch: waker's CPU is by definition running.
  * Noinline: only 3 args (p, wake_flags, hint_tctx) — r1→r6, r2→r7, r3→r8.
  * hint_tctx is the pointer already obtained by the IRQ-detection block at
- * the top of cider_select_cpu; passing it here eliminates a second
+ * the top of imperator_select_cpu; passing it here eliminates a second
  * bpf_task_storage_get (~20c) on the SYNC path (the dominant gaming wakeup).
  * hint_tctx may be NULL for unclassified tasks — consume_irq_wake_get_tier_slice
  * handles that case with safe defaults.
@@ -390,14 +437,14 @@ consume_irq_wake_get_tier_slice(struct cider_task_ctx *tctx, u64 *slice_out)
  * fallthrough to kernel path which handles cpumask correctly. */
 static __attribute__((noinline))
 s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags,
-                       struct cider_task_ctx *hint_tctx)
+                       struct imperator_task_ctx *hint_tctx)
 {
     u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
     if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
         return -1;
 
     /* Use the tctx pointer already in hand — no second storage lookup needed. */
-    struct cider_task_ctx *tctx = hint_tctx;
+    struct imperator_task_ctx *tctx = hint_tctx;
 
     /* Determine effective tier and slice via shared helper.
      * consume_irq_wake_get_tier_slice() handles the CAKE_FLOW_IRQ_WAKE one-shot
@@ -409,7 +456,7 @@ s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags,
 
     /* FIX (#11): Count direct-dispatch stats so TUI reflects the common idle-path case. */
     if (enable_stats) {
-        struct cider_stats *s = get_local_stats();
+        struct imperator_stats *s = get_local_stats();
         if (s) {
             s->nr_new_flow_dispatches++;
             if (tier < CAKE_TIER_MAX)
@@ -420,7 +467,7 @@ s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags,
     return (s32)cpu;
 }
 
-s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
+s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
     /* ── IRQ-SOURCE WAKEUP DETECTION (adapted from LAVD lavd_select_cpu) ──
@@ -447,7 +494,7 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /* Fetch tctx only when a downstream path will consume it */
-    struct cider_task_ctx *irq_tctx =
+    struct imperator_task_ctx *irq_tctx =
         (irq_context || (wake_flags & SCX_WAKE_SYNC)) ?
         bpf_task_storage_get(&task_ctx, p, 0, 0) : NULL;
 
@@ -467,7 +514,7 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     u32 tc_id = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    struct cider_scratch *scr = &global_scratch[tc_id];
+    struct imperator_scratch *scr = &global_scratch[tc_id];
     s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &scr->dummy_idle);
 
     if (scr->dummy_idle) {
@@ -475,7 +522,7 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
          * Fetch it now that we know we're on the direct-dispatch path and
          * need the task's actual tier + slice.  If already fetched (IRQ path),
          * reuse it — no second lookup. */
-        struct cider_task_ctx *tctx = irq_tctx ?
+        struct imperator_task_ctx *tctx = irq_tctx ?
             irq_tctx : bpf_task_storage_get(&task_ctx, p, 0, 0);
 
         /* Shared helper handles flag consumption, stats, and NULL-tctx fallback. */
@@ -486,7 +533,7 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
 
         /* FIX (#11): Count idle-path direct dispatches for accurate TUI stats. */
         if (enable_stats) {
-            struct cider_stats *s = get_local_stats();
+            struct imperator_stats *s = get_local_stats();
             if (s) {
                 s->nr_new_flow_dispatches++;
                 if (tier < CAKE_TIER_MAX)
@@ -511,14 +558,14 @@ s32 BPF_STRUCT_OPS(cider_select_cpu, struct task_struct *p, s32 prev_cpu,
     return prev_cpu;
 }
 
-/* ENQUEUE-TIME KICK: DISABLED.
- * A/B testing confirmed kicks cause 16fps 1% low regression in Arc Raiders
+/* ENQUEUE-TIME KICK: DISABLED for T2/T3.
+ * A/B testing confirmed indiscriminate kicks cause 16fps 1% low regression in Arc Raiders
  * (252fps without kick, 236fps with T3-only kick). Even T3-only kicks create
- * cache pollution and GPU pipeline bubbles. Tick-based starvation detection
- * is sufficient for gaming workloads. */
+ * cache pollution and GPU pipeline bubbles. T0/T1 kicks are retained via the
+ * O(1) bitmask path below; tick-based starvation detection covers the rest. */
 
 /* Enqueue - A+B architecture: per-LLC DSQ with vtime = (tier << 56) | timestamp */
-void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
 {
     register struct task_struct *p_reg asm("r6") = p;
     u32 task_flags = p_reg->flags;
@@ -527,13 +574,13 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
      * Eliminates 2 kfunc trampolines (~40-60ns) — select_cpu always runs on
      * the same CPU immediately before enqueue, so values are fresh. */
     u32 enq_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    struct cider_scratch *scr = &global_scratch[enq_cpu];
+    struct imperator_scratch *scr = &global_scratch[enq_cpu];
     u64 now_cached = scr->cached_now;
     u32 enq_llc = scr->cached_llc;
 
-    struct cider_task_ctx *tctx = get_task_ctx(p_reg, false);
+    struct imperator_task_ctx *tctx = get_task_ctx(p_reg, false);
 
-    /* FIX (#10): Kthreads without a tctx (race window before cider_enable fires)
+    /* FIX (#10): Kthreads without a tctx (race window before imperator_enable fires)
      * previously received CAKE_TIER_CRITICAL unconditionally, giving kcompactd,
      * kswapd, and similar bulk kthreads unwarranted T0 priority that could starve
      * game threads. Changed to CAKE_TIER_INTERACT (T1) which matches the tier
@@ -546,7 +593,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
-    register struct cider_task_ctx *tctx_reg asm("r7") = tctx;
+    register struct imperator_task_ctx *tctx_reg asm("r7") = tctx;
 
     /* FIX (#3): Voluntarily yielding T0/T1 tasks (sched_yield, brief hardware wait)
      * were previously hard-coded to CAKE_TIER_BULK, sending audio/input threads to
@@ -574,10 +621,10 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
     u64 slice = tctx_reg->next_slice;
 
     /* Load packed_info once — shared by all three feature checks below. */
-    u32 task_packed = cider_relaxed_load_u32(&tctx_reg->packed_info);
+    u32 task_packed = imperator_relaxed_load_u32(&tctx_reg->packed_info);
 
     /* ── FEATURE 1: IRQ-SOURCE TIER OVERRIDE (adapted from LAVD) ──────────
-     * If cider_select_cpu stamped CAKE_FLOW_IRQ_WAKE, this task was woken
+     * If imperator_select_cpu stamped CAKE_FLOW_IRQ_WAKE, this task was woken
      * directly from a hardware interrupt or softirq bottom-half. It should
      * run at T0 for this dispatch regardless of its current EWMA tier, for
      * the same reason LAVD applies LAVD_LC_WEIGHT_BOOST_HIGHEST: the
@@ -597,7 +644,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
         tier = CAKE_TIER_CRITICAL;  /* T0 for this dispatch only */
 
         if (enable_stats) {
-            struct cider_stats *s = get_local_stats();
+            struct imperator_stats *s = get_local_stats();
             if (s) s->nr_irq_wake_boosts++;
         }
     }
@@ -615,7 +662,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
      * a few bouts if the pattern is consistent.
      *
      * Cost: one BSS L1 read (mega_mailbox[enq_cpu].flags, already in L1
-     * from any recent cider_tick on this CPU) + one comparison + one branch.
+     * from any recent imperator_tick on this CPU) + one comparison + one branch.
      * ~4 cycles on an uncontested cacheline; zero if waker_tier >= tier.
      *
      * Constraints:
@@ -631,16 +678,16 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
      *
      * NOTE: enq_cpu is the waker's CPU — the same CPU that ran select_cpu
      * and is now running enqueue. mega_mailbox[enq_cpu].flags contains the
-     * tier of the last task that ran on this CPU, set by cider_tick. */
+     * tier of the last task that ran on this CPU, set by imperator_tick. */
     if ((enq_flags & SCX_ENQ_WAKEUP) && tier > CAKE_TIER_CRITICAL) {
         struct mega_mailbox_entry *waker_mbox = &mega_mailbox[enq_cpu];
-        /* Guard: only inherit when cider_running has written valid tier data to
-         * this CPU's mailbox.  cider_running writes flags unconditionally on every
+        /* Guard: only inherit when imperator_running has written valid tier data to
+         * this CPU's mailbox.  imperator_running writes flags unconditionally on every
          * context switch, so a non-zero flags byte means the mailbox is initialized.
          * tick_counter was previously used here but becomes valid only after the
-         * first cider_tick — a longer window than necessary since cider_running
+         * first imperator_tick — a longer window than necessary since imperator_running
          * makes the mailbox valid from the very first context switch. */
-        u8 cur_mbox_flags = cider_relaxed_load_u8(&waker_mbox->flags);
+        u8 cur_mbox_flags = imperator_relaxed_load_u8(&waker_mbox->flags);
         if (cur_mbox_flags != 0) {
             u8 waker_tier = MBOX_GET_TIER(cur_mbox_flags);
             if (waker_tier < tier) {
@@ -666,7 +713,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
                 if (promoted < tier) {
                     tier = promoted;
                     if (enable_stats) {
-                        struct cider_stats *s = get_local_stats();
+                        struct imperator_stats *s = get_local_stats();
                         if (s) s->nr_waker_tier_boosts++;
                     }
                 }
@@ -675,7 +722,7 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     if (enable_stats) {
-        struct cider_stats *s = get_local_stats();
+        struct imperator_stats *s = get_local_stats();
         if (s) {
             if (enq_flags & SCX_ENQ_WAKEUP)
                 s->nr_new_flow_dispatches++;
@@ -732,71 +779,66 @@ void BPF_STRUCT_OPS(cider_enqueue, struct task_struct *p, u64 enq_flags)
     /* Mark LLC as non-empty so dispatch can find work */
     llc_mark_nonempty(enq_llc);
 
-    /* ── FIX (audit): TIER-GATED PREEMPTION KICK ─────────────────────────────
-     * Problem: when all CPUs are busy, a T0/T1 task inserted above waits in the
-     * LLC DSQ until a CPU naturally goes idle.  T3 slices are 8ms; T3 starvation
-     * threshold is 100ms.  Without an explicit kick, a T0 audio/input task can
-     * wait up to one full T3 slice (8ms) before getting a CPU — enough to cause
-     * audio glitches (5.3ms buffer at 48kHz/256 samples) or visible input lag.
+    /* ── [F] s6: O(1) BITMASK PREEMPTION KICK ────────────────────────────────
+     * When a T0/T1 task is enqueued into the LLC DSQ and all CPUs are busy,
+     * kick a victim CPU in the same LLC that is running a lower-priority task
+     * (T3 preferred, then T2) so it context-switches and pulls the waiting
+     * high-priority task via imperator_dispatch.
      *
-     * Fix: after inserting a T0 or T1 task into the LLC DSQ, scan mega_mailbox
-     * for the CPU in this LLC that is running the lowest-priority (highest tier
-     * number) task.  If that CPU is running T2 or T3, kick it with SCX_KICK_PREEMPT
-     * so it context-switches on the next tick and pulls the waiting high-priority
-     * task via cider_dispatch.
+     * O(1) via tier_cpu_mask × llc_cpu_mask:
+     *   tier_cpu_mask[t]: bitmask of CPUs currently running tier-t tasks
+     *                     (maintained by imperator_running/imperator_stopping)
+     *   llc_cpu_mask[l]:  bitmask of CPUs belonging to LLC l
+     *                     (computed by imperator_init from cpu_llc_id RODATA)
+     *   AND of the two → CPUs in this LLC running that tier → BSF → victim
      *
-     * Why not kick on every enqueue (original design)?
-     *   A/B testing showed kicking on every enqueue — including T3→T3 — caused a
-     *   16fps 1% low regression in Arc Raiders (252→236fps).  The regression
-     *   comes from thrashing LLC cache lines when two T3 tasks trade the same CPU.
-     *   Gating on tier <= CAKE_TIER_INTERACT (T0 or T1) avoids the T3→T3 case
-     *   entirely: T0/T1 tasks run < 2ms, their working sets are small, and the
-     *   cache pollution from displacing a T2/T3 task is minimal compared to the
-     *   latency benefit.
+     * Victim preference: T3 (bulk) first — displacing a bulk task costs the
+     * least in frame-time disruption.  Fallback to T2 (frame) only when no T3
+     * CPU is present in the LLC.  T1 and T0 are not kicked — we never displace
+     * a latency-critical task to run another one.
      *
-     * Cost: O(threads_per_LLC) relaxed mailbox reads — all L1 cache hits since
-     * mega_mailbox entries are written every tick by the owning CPU.  On a
-     * 16-thread CCD this is ≤16 L1 reads (~3–4 cycles each) on the T0/T1
-     * enqueue path, which is ~5% of total enqueue work — acceptable.
+     * Cost vs previous O(nr_cpus) mailbox scan (16-thread LLC):
+     *   Removed: 16 relaxed u8 loads (scattered mailbox lines) + 16 cpu_llc_id
+     *            reads + loop overhead + max-tracking branch
+     *   Added:   2 relaxed u64 loads (tier_cpu_mask, same cache line)
+     *            + 1 relaxed u64 load (llc_cpu_mask, RODATA)
+     *            + 1 AND + 1 BSF per tier attempted
+     *   Net: ~80–100 cycles removed, ~12 cycles added
      *
-     * We skip the kick when the task itself was direct-dispatched (SCX_DSQ_LOCAL_ON
-     * paths in select_cpu) because those tasks already have a CPU claimed. */
+     * Correctness: llc_cpu_mask is guaranteed non-zero by imperator_init [C] for
+     * any LLC with at least one CPU.  AND with tier_cpu_mask produces zero only
+     * when genuinely no T3/T2 CPU exists in the LLC — the correct "no victim"
+     * result.  The previous all-zero risk from a missing Rust write no longer
+     * exists. */
     if (tier <= CAKE_TIER_INTERACT) {
-        u32 best_cpu    = CAKE_MAX_CPUS;  /* sentinel: no victim found */
-        u8  worst_tier  = CAKE_TIER_INTERACT; /* only displace T2 or T3 */
+        u64 my_llc_mask = imperator_relaxed_load_u64(
+            &llc_cpu_mask[enq_llc & (CAKE_MAX_LLCS - 1)]);
 
-        /* S6: start scan at enq_cpu rather than 0.
-         * When multiple T0 IRQs fire simultaneously (audio DMA + GPU vsync
-         * + network), each fires on a different enq_cpu, so concurrent scans
-         * naturally spread their kick targets across the LLC.  Cost: one AND
-         * per iteration replacing one compare — identical to before. */
-        for (u32 i = 0; i < nr_cpus; i++) {
-            u32 c = (enq_cpu + i) & (CAKE_MAX_CPUS - 1);
-            if (cpu_llc_id[c] != enq_llc)
-                continue;
-            u8 mf = cider_relaxed_load_u8(&mega_mailbox[c].flags);
-            u8 ct = MBOX_GET_TIER(mf);
-            if (ct > worst_tier) {
-                worst_tier = ct;
-                best_cpu   = c;
-            }
+        /* Prefer displacing T3 (bulk) — lowest frame-time displacement cost */
+        u64 t3_in_llc = imperator_relaxed_load_u64(
+            &tier_cpu_mask[CAKE_TIER_BULK]) & my_llc_mask;
+        if (t3_in_llc) {
+            scx_bpf_kick_cpu(BIT_SCAN_FORWARD_U64(t3_in_llc), SCX_KICK_PREEMPT);
+        } else {
+            /* Fall back to displacing T2 (frame) when no T3 present in LLC */
+            u64 t2_in_llc = imperator_relaxed_load_u64(
+                &tier_cpu_mask[CAKE_TIER_FRAME]) & my_llc_mask;
+            if (t2_in_llc)
+                scx_bpf_kick_cpu(BIT_SCAN_FORWARD_U64(t2_in_llc), SCX_KICK_PREEMPT);
         }
-
-        if (best_cpu < CAKE_MAX_CPUS)
-            scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
     }
 }
 
 /* Dispatch: per-LLC DSQ scan with bitmask-driven cross-LLC stealing.
  * Direct-dispatched tasks (SCX_DSQ_LOCAL_ON) bypass this callback entirely —
  * kernel handles them natively. Only tasks that went through
- * cider_enqueue → per-LLC DSQ arrive here.
+ * imperator_enqueue → per-LLC DSQ arrive here.
  *
  * FIX (audit): steal mask is now built by reading per-LLC nonempty[] bytes
  * rather than a single shared llc_nonempty_mask word.  This eliminates the
  * cross-LLC cache-line bounce on every enqueue while keeping the steal scan
  * O(nr_llcs) — at most 8 reads, each from a distinct LLC-local cache line. */
-void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
 {
     u32 my_llc = cpu_llc_id[raw_cpu & (CAKE_MAX_CPUS - 1)];
 
@@ -805,7 +847,7 @@ void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
         return;
 
     /* Drain confirmed empty — clear our entry so other CPUs don't steal here */
-    cider_relaxed_store_u8(&llc_nonempty[my_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+    imperator_relaxed_store_u8(&llc_nonempty[my_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
 
     /* RODATA gate: single-LLC systems skip steal entirely (Rule 5).
      * JIT DCEs the loop below when nr_llcs == 1. */
@@ -836,7 +878,7 @@ void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
 
     for (u32 i = 0; i < nr_llcs; i++) {
         if (i != my_llc &&
-            cider_relaxed_load_u8(&llc_nonempty[i].nonempty)) {
+            imperator_relaxed_load_u8(&llc_nonempty[i].nonempty)) {
             steal_mask |= 1u << i;
             u8 c = llc_etd_cost[my_llc & (CAKE_MAX_LLCS - 1)][i & (CAKE_MAX_LLCS - 1)];
             /* Only update cheapest when ETD data is present (c > 0). */
@@ -852,7 +894,7 @@ void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
         steal_mask &= ~(1u << cheapest_llc);
         if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + cheapest_llc))
             return;
-        cider_relaxed_store_u8(&llc_nonempty[cheapest_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+        imperator_relaxed_store_u8(&llc_nonempty[cheapest_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
     }
 
     /* Try remaining LLCs in BSF order (original behaviour) */
@@ -865,7 +907,7 @@ void BPF_STRUCT_OPS(cider_dispatch, s32 raw_cpu, struct task_struct *prev)
         if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + victim))
             return;
         /* Victim was empty despite flag being set — clear stale entry */
-        cider_relaxed_store_u8(&llc_nonempty[victim & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+        imperator_relaxed_store_u8(&llc_nonempty[victim & (CAKE_MAX_LLCS - 1)].nonempty, 0);
     }
 }
 
@@ -882,11 +924,11 @@ const u32 tier_perf_target[8] = {
     768, 768, 768, 768,  /* padding */
 };
 
-void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
+void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
 {
     /* Register pin p to r6 to avoid stack spills */
     register struct task_struct *p_reg asm("r6") = p;
-    register struct cider_task_ctx *tctx_reg asm("r7") = get_task_ctx(p_reg, false);
+    register struct imperator_task_ctx *tctx_reg asm("r7") = get_task_ctx(p_reg, false);
     register u32 cpu_id_reg asm("r8") = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
 
     u32 now = (u32)scx_bpf_now();
@@ -902,8 +944,18 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
     u32 last_run = tctx_reg->last_run_at;
     u64 runtime = (u64)(now - last_run);
 
-    /* Slice exceeded: force context switch */
+    /* Slice exceeded: force context switch.
+     * FIX (M-2): Update mailbox tier before kicking — mirrors the starvation
+     * preemption path (FIX #4).  A task woken from this CPU in the window
+     * between the slice-expiry kick and the next imperator_running would otherwise
+     * inherit the kicked task's stale tier from the mailbox rather than the
+     * new task's tier.  The starvation path was already fixed; this makes the
+     * two kick paths consistent. */
     if (unlikely(runtime > tctx_reg->next_slice)) {
+        struct mega_mailbox_entry *exp_mbox = &mega_mailbox[cpu_id_reg];
+        u8 exp_flags = (tier_reg & MBOX_TIER_MASK);
+        if (imperator_relaxed_load_u8(&exp_mbox->flags) != exp_flags)
+            imperator_relaxed_store_u8(&exp_mbox->flags, exp_flags);
         scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
         return;
     }
@@ -923,17 +975,17 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
      * yields tc=24 (still in the every-4th-tick zone); the counter recovers to
      * tc=32 in ~8 ticks (~8ms) under oscillating contention. */
     struct mega_mailbox_entry *mbox = &mega_mailbox[cpu_id_reg];
-    u8 tc = cider_relaxed_load_u8(&mbox->tick_counter);
+    u8 tc = imperator_relaxed_load_u8(&mbox->tick_counter);
     u8 skip_mask = tc < 8 ? 0 : tc < 16 ? 1 : tc < 32 ? 3 : 7;
 
     if (!(tc & skip_mask)) {
-        struct rq *rq = cider_get_rq(cpu_id_reg);
+        struct rq *rq = imperator_get_rq(cpu_id_reg);
         if (rq && rq->scx.nr_running > 1) {
             /* Contention detected — quarter-decay confidence (tc -= tc >> 2).
              * Subtracting 25% keeps tc in the same skip-mask zone after a
              * single event (tc=32 → tc=24, still every-4th-tick), recovering
              * to tc=32 in ~8 ticks (~8ms) under oscillating contention. */
-            cider_relaxed_store_u8(&mbox->tick_counter, tc - (tc >> 2));
+            imperator_relaxed_store_u8(&mbox->tick_counter, tc - (tc >> 2));
 
             u64 threshold = UNPACK_STARVATION_NS(tier_configs[CAKE_TIER_IDX(tier_reg)]);
             if (unlikely(runtime > threshold)) {
@@ -960,7 +1012,7 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
                  * Cost: one relaxed atomic read of packed_info (already in L1 from
                  * PHASE 1) + one AND + one branch-not-taken. ~2 cycles on the common
                  * path (not a lock holder). */
-                u32 tick_packed = cider_relaxed_load_u32(&tctx_reg->packed_info);
+                u32 tick_packed = imperator_relaxed_load_u32(&tctx_reg->packed_info);
                 if (unlikely(tick_packed & ((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS))) {
                     /* FIX (gap/lock-skip-cap): Cap consecutive skips at 4.
                      * Each skip defers preemption by one starvation-threshold
@@ -975,7 +1027,7 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
                     if (skips < 4) {
                         tctx_reg->lock_skip_count = skips + 1;
                         if (enable_stats) {
-                            struct cider_stats *s = get_local_stats();
+                            struct imperator_stats *s = get_local_stats();
                             if (s) s->nr_lock_holder_skips++;
                         }
                         goto mailbox_dvfs;  /* Still update mailbox and DVFS */
@@ -988,7 +1040,7 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
                 scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
 
                 if (enable_stats && tier_reg < CAKE_TIER_MAX) {
-                    struct cider_stats *s = get_local_stats();
+                    struct imperator_stats *s = get_local_stats();
                     if (s) s->nr_starvation_preempts_tier[tier_reg]++;
                 }
 
@@ -997,24 +1049,24 @@ void BPF_STRUCT_OPS(cider_tick, struct task_struct *p)
                  * mega_mailbox[cpu].flags stale.  Any task woken from this CPU
                  * immediately after the kick would inherit the preempted task's
                  * tier via the Feature 2 waker-tier inheritance path in
-                 * cider_enqueue — exactly the wrong value at the worst time.
+                 * imperator_enqueue — exactly the wrong value at the worst time.
                  * Update flags unconditionally here (same 2-cycle conditional
                  * store as the mailbox_dvfs block) before kicking so the next
                  * wakee sees the correct tier.  DVFS is still skipped (next
                  * task's first tick will correct frequency within ~1ms). */
                 u8 kick_flags = (tier_reg & MBOX_TIER_MASK);
-                if (cider_relaxed_load_u8(&mbox->flags) != kick_flags)
-                    cider_relaxed_store_u8(&mbox->flags, kick_flags);
+                if (imperator_relaxed_load_u8(&mbox->flags) != kick_flags)
+                    imperator_relaxed_store_u8(&mbox->flags, kick_flags);
 
                 return;
             }
         } else {
             /* No contention — grow confidence (saturate at 255) */
-            if (tc < 255) cider_relaxed_store_u8(&mbox->tick_counter, tc + 1);
+            if (tc < 255) imperator_relaxed_store_u8(&mbox->tick_counter, tc + 1);
         }
     } else {
         /* Skipped check — still increment counter for next mask eval */
-        if (tc < 255) cider_relaxed_store_u8(&mbox->tick_counter, tc + 1);
+        if (tc < 255) imperator_relaxed_store_u8(&mbox->tick_counter, tc + 1);
     }
 
 mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6.8.1) */
@@ -1022,17 +1074,17 @@ mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6
     /* MEGA-MAILBOX UPDATE: tier for dispatch to consume.
      *
      * FIX (audit): Plain struct-member assignment is a data race under the C11
-     * memory model on weakly-ordered architectures (ARM64).  cider_tick writes
-     * mbox->flags and mbox->dsq_hint on the owning CPU; cider_enqueue reads
+     * memory model on weakly-ordered architectures (ARM64).  imperator_tick writes
+     * mbox->flags and mbox->dsq_hint on the owning CPU; imperator_enqueue reads
      * mbox->flags on other CPUs for waker-tier inheritance.  Without atomic
      * semantics the store is not guaranteed to be visible.  Use
-     * cider_relaxed_store_u8 which emits __ATOMIC_RELAXED on Clang ≥21 (a plain
+     * imperator_relaxed_store_u8 which emits __ATOMIC_RELAXED on Clang ≥21 (a plain
      * MOV with a compiler barrier) and the targeted inline-asm store on older
      * compilers.  Both paths prevent compiler reordering and guarantee
      * architectural store visibility — the minimal requirement for a flag. */
     u8 new_flags = (tier_reg & MBOX_TIER_MASK);
-    if (cider_relaxed_load_u8(&mbox->flags) != new_flags)
-        cider_relaxed_store_u8(&mbox->flags, new_flags);
+    if (imperator_relaxed_load_u8(&mbox->flags) != new_flags)
+        imperator_relaxed_store_u8(&mbox->flags, new_flags);
 
     /* DVFS: Tier-proportional CPU frequency steering.
      * Runs in tick (rq-locked) = ~15-20ns vs ~30-80ns unlocked in running.
@@ -1046,46 +1098,56 @@ mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6
         u32 cap = scx_bpf_cpuperf_cap(cpu_id_reg);
         target = (target * cap) >> 10;  /* scale by capability (1024 = 100%) */
     }
-    u8 cached_perf = cider_relaxed_load_u8(&mbox->dsq_hint);
+    u8 cached_perf = imperator_relaxed_load_u8(&mbox->dsq_hint);
     u8 target_cached = (u8)(target >> 2);
     if (cached_perf != target_cached) {
         scx_bpf_cpuperf_set(cpu_id_reg, target);
-        cider_relaxed_store_u8(&mbox->dsq_hint, target_cached);
+        imperator_relaxed_store_u8(&mbox->dsq_hint, target_cached);
     }
 }
 
-/* Task started running - stamp last_run_at for runtime measurement.
- * DVFS moved to cider_tick where rq lock is held (cpuperf_set ~15-20ns vs
+/* Task started running — stamp last_run_at for runtime measurement and
+ * eagerly publish tier to mega_mailbox + tier_cpu_mask.
+ *
+ * [D] s6: Set this CPU's bit in tier_cpu_mask for the new task's tier.
+ * imperator_stopping owns all clears; running only sets — no double-ownership.
+ *
+ * DVFS moved to imperator_tick where rq lock is held (cpuperf_set ~15-20ns vs
  * ~30-80ns unlocked here). Saves ~44-84 cycles per context switch. */
-void BPF_STRUCT_OPS(cider_running, struct task_struct *p)
+void BPF_STRUCT_OPS(imperator_running, struct task_struct *p)
 {
-    struct cider_task_ctx *tctx = get_task_ctx(p, false);
+    struct imperator_task_ctx *tctx = get_task_ctx(p, false);
     if (!tctx)
         return;
     tctx->last_run_at = (u32)scx_bpf_now();
 
+    u32 run_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
+    struct mega_mailbox_entry *mbox = &mega_mailbox[run_cpu];
+    u8 tier = CAKE_TIER_IDX(GET_TIER(tctx));
+
     /* FIX (audit): Eagerly publish the task's tier to mega_mailbox so that
-     * waker-tier inheritance in cider_enqueue sees the correct tier from the
+     * waker-tier inheritance in imperator_enqueue sees the correct tier from the
      * very first nanosecond of this task's run, not after its first tick.
      *
-     * cider_tick updates the mailbox at HZ intervals (1–4ms).  Any task woken
+     * imperator_tick updates the mailbox at HZ intervals (1–4ms).  Any task woken
      * by this CPU in the window between context switch and the first tick
      * inherited the *previous* task's tier from the mailbox — the wrong value
      * at the worst time (right after a T0 audio thread is scheduled, the
      * mailbox might still show T3 from the bulk task it preempted).
      *
      * Cost: one conditional relaxed store per context switch (~2 cycles on an
-     * uncontested cache line).  The tick_counter > 0 guard in cider_enqueue is
-     * preserved as a "mailbox ever written" boot-time sentinel — this write
-     * happens unconditionally, so tick_counter becomes redundant for correctness
-     * once the system is running, but harmless to keep. */
-    u32 run_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    struct mega_mailbox_entry *mbox = &mega_mailbox[run_cpu];
-    u8 tier = CAKE_TIER_IDX(GET_TIER(tctx));
-    u8 cur_flags = cider_relaxed_load_u8(&mbox->flags);
+     * uncontested cache line). */
+    u8 cur_flags = imperator_relaxed_load_u8(&mbox->flags);
     if ((cur_flags & MBOX_TIER_MASK) != tier)
-        cider_relaxed_store_u8(&mbox->flags,
+        imperator_relaxed_store_u8(&mbox->flags,
             (cur_flags & ~MBOX_TIER_MASK) | tier);
+
+    /* [D] s6: Mark this CPU as running a task of 'tier'.
+     * BPF_ATOMIC_OR: single instruction, not a CAS loop.  Each CPU writes
+     * only its own bit (1ULL << run_cpu) — no two CPUs contend on the same
+     * bit.  The word-level atomic prevents torn read-modify-write when two
+     * CPUs in different tiers update the same u64 simultaneously. */
+    __sync_fetch_and_or(&tier_cpu_mask[tier & (CAKE_TIER_MAX - 1)], 1ULL << run_cpu);
 }
 
 /* Precomputed hysteresis gate tables (RODATA — JIT constant-folds these).
@@ -1100,11 +1162,9 @@ static const u16 tier_gate_promote[3] = {
 };
 
 /* S5: 1.5× tier-gate overrun thresholds.
- * A task consistently exceeding its tier gate by 50% on 4 consecutive bouts
- * triggers an immediate forced demotion, cutting worst-case misclassification
- * from ~128ms (EWMA slow-demote path) to ~8ms.  1.5× rather than 1.0× avoids
- * false-triggering on normal EWMA bounce near the boundary.  T3 entry is 0:
- * bulk tasks have no gate to exceed. */
+ * A task consistently exceeding its tier gate triggers forced demotion.
+ * 1.5× rather than 1.0× avoids false-triggering on normal EWMA bounce near
+ * the boundary.  T3 entry is 0: bulk tasks have no gate to exceed. */
 static const u16 tier_overrun_gate[4] = {
     TIER_GATE_T0 + TIER_GATE_T0 / 2,   /* T0: 150µs  */
     TIER_GATE_T1 + TIER_GATE_T1 / 2,   /* T1: 3000µs */
@@ -1124,9 +1184,9 @@ static const u16 tier_overrun_gate[4] = {
  * at the same tier.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static __attribute__((noinline))
-void reclassify_task_cold(struct cider_task_ctx *tctx)
+void reclassify_task_cold(struct imperator_task_ctx *tctx)
 {
-    u32 packed = cider_relaxed_load_u32(&tctx->packed_info);
+    u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
 
     /* ── RUNTIME MEASUREMENT ── */
     u32 now = (u32)scx_bpf_now();
@@ -1231,7 +1291,7 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
 
             if (spot_tier != tier) {
                 u32 reset = packed & ~((u32)3 << SHIFT_STABLE);
-                cider_relaxed_store_u32(&tctx->packed_info, reset);
+                imperator_relaxed_store_u32(&tctx->packed_info, reset);
                 tctx->reclass_counter = 0;
             }
             return;
@@ -1305,27 +1365,45 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
     if (new_avg > (u16)(TIER_GATE_T2 * 3) && stable >= 3 && new_tier < CAKE_TIER_BULK)
         new_tier = CAKE_TIER_BULK;
 
-    /* ── S5: CONSECUTIVE OVERRUN DEMOTION ──
-     * If rt_clamped has exceeded 1.5× the tier gate for 4 consecutive bouts,
-     * force-demote by one tier even if the EWMA hasn't crossed the gate yet.
-     * Resets the counter and stability on any forced demotion.
-     * Only checked for T0–T2; T3 tasks are already bulk. */
+    /* ── [H] s6: BIT-HISTORY OVERRUN DEMOTION ───────────────────────────────
+     * overrun_count is an 8-bit shift register of the last 8 execution outcomes.
+     * Each stop shifts left one position and inserts the current bout's result
+     * in the LSB; the oldest result falls off the MSB.
+     *
+     *   bit = 1  →  that bout's rt_clamped exceeded 1.5× the tier gate
+     *   bit = 0  →  that bout ran within the gate
+     *
+     * DEMOTION TRIGGER: __builtin_popcount(overrun_count) >= 4
+     *   Fires when 4 of the last 8 bouts exceeded the gate.
+     *
+     * BEHAVIORAL SUPERSET OF THE ORIGINAL CONSECUTIVE COUNTER:
+     *   4 consecutive overruns → hist=0b00001111 → popcount=4 ≥ 4 → DEMOTE ✓
+     *   4 alternating overruns → popcount=4 ≥ 4 → DEMOTE ✓ (new capability)
+     *   Original counter reset on every clean bout — alternating never fired.
+     *
+     * THRESHOLD CORRECTION vs previous patch: 5 → 4.
+     *   With threshold 5: 4 consecutive overruns → popcount=4 < 5 → NO DEMOTE.
+     *   That was a regression vs the original counter which fired at exactly 4.
+     *   With threshold 4: parity restored; non-consecutive patterns gain coverage.
+     *
+     * Only checked for T0–T2; T3 tasks are already bulk.
+     * COST: shift + OR + popcount ≈ 4 cycles (identical to original inc+compare). */
     if (old_tier < CAKE_TIER_BULK) {
-        u16 og = tier_overrun_gate[CAKE_TIER_IDX(old_tier)];
-        if (rt_clamped > og) {
-            u8 oc = tctx->overrun_count + 1;
-            if (oc >= 4) {
-                u8 forced = (old_tier < CAKE_TIER_BULK) ?
-                    (u8)(old_tier + 1) : (u8)CAKE_TIER_BULK;
-                if (new_tier < forced)
-                    new_tier = forced;
-                tctx->overrun_count = 0;
-                stable = 0;  /* reset so new_stable below starts from 0 */
-            } else {
-                tctx->overrun_count = oc;
-            }
-        } else {
+        u16 og      = tier_overrun_gate[CAKE_TIER_IDX(old_tier)];
+        u8  outcome = (rt_clamped > og) ? 1u : 0u;
+
+        /* Shift register: oldest outcome falls off MSB, new enters LSB */
+        u8 hist = (u8)((tctx->overrun_count << 1) | outcome);
+        tctx->overrun_count = hist;
+
+        if (__builtin_popcount((unsigned int)hist) >= 4) {
+            /* Force-demote by one tier; floor at CAKE_TIER_BULK.
+             * We are inside (old_tier < CAKE_TIER_BULK) so old_tier+1 is safe. */
+            u8 forced = (u8)(old_tier + 1);
+            if (new_tier < forced)
+                new_tier = forced;
             tctx->overrun_count = 0;
+            stable = 0;  /* reset so new_stable below starts from 0 */
         }
     }
 
@@ -1346,7 +1424,7 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
         if (deficit_exhausted)
             new_packed &= ~((u32)CAKE_FLOW_NEW << SHIFT_FLAGS);
 
-        cider_relaxed_store_u32(&tctx->packed_info, new_packed);
+        imperator_relaxed_store_u32(&tctx->packed_info, new_packed);
     }
 
     /* ── SLICE RECALCULATION on tier change ── */
@@ -1377,15 +1455,15 @@ void reclassify_task_cold(struct cider_task_ctx *tctx)
  * closer to the right answer.  Child tier is set to match the parent's current
  * tier so the very first dispatch also goes into the correct DSQ bucket.
  *
- * The child context is guaranteed to exist because cider_fork fires after
- * cider_enable (which pre-allocates it).  If alloc somehow raced and ctx is
+ * The child context is guaranteed to exist because imperator_fork fires after
+ * imperator_enable (which pre-allocates it).  If alloc somehow raced and ctx is
  * NULL, we return 0 cleanly — the child falls back to nice-value seeding. */
-s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
+s32 BPF_STRUCT_OPS(imperator_init_task, struct task_struct *p,
                    struct scx_init_task_args *args)
 {
     /* init_task fires for every task entering scx control, not just forked
      * children.  For exec() (args->fork == false) the task retains its old
-     * task_struct — and therefore its old cider_task_ctx — from before the
+     * task_struct — and therefore its old imperator_task_ctx — from before the
      * exec.  A shell or build tool that execs a game binary would carry a T3
      * avg_runtime classification into the new process image, causing the game's
      * first render threads to compete at T3 for 6-16 EWMA bouts before
@@ -1395,7 +1473,7 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
      * logic as alloc_task_ctx_cold) so the post-exec EWMA starts from a
      * sensible prior rather than the pre-exec process's stale history. */
     if (!args->fork) {
-        struct cider_task_ctx *tctx = get_task_ctx(p, false);
+        struct imperator_task_ctx *tctx = get_task_ctx(p, false);
         if (!tctx)
             return 0;
 
@@ -1418,10 +1496,10 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
          * All other packed_info bits (FLAGS, WAIT_DATA, KALMAN_ERROR) are
          * preserved — CAKE_FLOW_NEW is already set by alloc_task_ctx_cold
          * and is still appropriate for a freshly exec'd process. */
-        u32 packed = cider_relaxed_load_u32(&tctx->packed_info);
+        u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
         packed &= ~((u32)0xF << 28);
         packed |=  (u32)init_tier << SHIFT_TIER;
-        cider_relaxed_store_u32(&tctx->packed_info, packed);
+        imperator_relaxed_store_u32(&tctx->packed_info, packed);
 
         /* Reset avg_runtime to tier midpoint; preserve existing deficit so the
          * new-flow bonus (already credited) is not revoked. */
@@ -1442,9 +1520,9 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
     }
 
     struct task_struct *parent = p->real_parent;
-    struct cider_task_ctx *ptctx = parent ?
+    struct imperator_task_ctx *ptctx = parent ?
         bpf_task_storage_get(&task_ctx, parent, 0, 0) : NULL;
-    struct cider_task_ctx *ctctx = get_task_ctx(p, false);
+    struct imperator_task_ctx *ctctx = get_task_ctx(p, false);
 
     if (!ptctx || !ctctx)
         return 0;
@@ -1452,7 +1530,7 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
     /* Read parent state atomically (relaxed — we only need approximate values) */
     u32  pfused  = ptctx->deficit_avg_fused;
     u16  pavg    = EXTRACT_AVG_RT(pfused);
-    u32  ppacked = cider_relaxed_load_u32(&ptctx->packed_info);
+    u32  ppacked = imperator_relaxed_load_u32(&ptctx->packed_info);
     u8   ptier   = (ppacked >> SHIFT_TIER) & MASK_TIER;
 
     /* Child avg starts at half the parent's — converges in ~3 bouts */
@@ -1463,10 +1541,10 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
 
     /* Inherit parent tier into packed_info, preserving all other bits
      * (CAKE_FLOW_NEW is already set by alloc_task_ctx_cold). */
-    u32 cpacked = cider_relaxed_load_u32(&ctctx->packed_info);
+    u32 cpacked = imperator_relaxed_load_u32(&ctctx->packed_info);
     cpacked &= ~((u32)MASK_TIER << SHIFT_TIER);
     cpacked |=  ((u32)ptier     << SHIFT_TIER);
-    cider_relaxed_store_u32(&ctctx->packed_info, cpacked);
+    imperator_relaxed_store_u32(&ctctx->packed_info, cpacked);
 
     /* Pre-compute slice for inherited tier so first dispatch uses correct quantum */
     u64 cfg  = tier_configs[CAKE_TIER_IDX(ptier)];
@@ -1478,31 +1556,61 @@ s32 BPF_STRUCT_OPS(cider_init_task, struct task_struct *p,
 
 /* Pre-allocate task context when a task enters scx control.
  * Fires once per task — not in the scheduling hot path.
- * Guarantees cider_running/cider_stopping never see a NULL context,
+ * Guarantees imperator_running/imperator_stopping never see a NULL context,
  * converting those null guards from live code paths to safety assertions. */
-s32 BPF_STRUCT_OPS(cider_enable, struct task_struct *p)
+s32 BPF_STRUCT_OPS(imperator_enable, struct task_struct *p)
 {
     get_task_ctx(p, true);
     return 0;
 }
 
-/* Task stopping — avg_runtime reclassification + DRR++ deficit tracking */
-void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
+/* Task stopping — clear tier_cpu_mask bit BEFORE reclassification, then
+ * run avg_runtime reclassification + DRR++ deficit tracking.
+ *
+ * [E] s6: ORDER IS CRITICAL.
+ *   GET_TIER(tctx) before reclassify = the tier the task was running at
+ *   = the tier whose bit is set in tier_cpu_mask = the correct bit to clear.
+ *   After reclassify_task_cold(), GET_TIER returns the new post-EWMA tier.
+ *   Clearing after reclassify would clear the wrong bit. */
+void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
 {
-    struct cider_task_ctx *tctx = get_task_ctx(p, false);
-    /* Skip tasks that have never been stamped by cider_running.
+    struct imperator_task_ctx *tctx = get_task_ctx(p, false);
+    /* Skip tasks that have never been stamped by imperator_running.
      * Avoids the noinline call overhead (~3-5 cycles) for the
      * uncommon case of a task stopping before its first run. */
-    if (tctx && likely(tctx->last_run_at))
+    if (tctx && likely(tctx->last_run_at)) {
+        /* [E] s6: Clear this CPU's bit from the tier that was running.
+         * Must happen before reclassify changes packed_info.tier. */
+        u32 stop_cpu  = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
+        u8  stop_tier = CAKE_TIER_IDX(GET_TIER(tctx));
+        __sync_fetch_and_and(
+            &tier_cpu_mask[stop_tier & (CAKE_TIER_MAX - 1)],
+            ~(1ULL << stop_cpu));
+
         reclassify_task_cold(tctx);
+    }
 }
 
-/* Initialize the scheduler */
-s32 BPF_STRUCT_OPS_SLEEPABLE(cider_init)
+/* Initialize the scheduler.
+ * [C] s6: Compute llc_cpu_mask from cpu_llc_id RODATA before any task runs.
+ *
+ * This eliminates the partial-deploy hazard: previously llc_cpu_mask had to
+ * be written by the Rust loader; if that write was absent (e.g. rolling update
+ * midway through deployment) the mask stayed all-zero and the O(1) bitmask
+ * kick produced zero kicks without any error or warning.  Now imperator_init fills
+ * it unconditionally from the already-correct cpu_llc_id RODATA. */
+s32 BPF_STRUCT_OPS_SLEEPABLE(imperator_init)
 {
-    /* Per-CPU DSQs eliminated — SCX_DSQ_LOCAL_ON dispatches directly to
-     * the kernel's built-in local DSQ, skipping dispatch callback entirely.
-     * Per-LLC DSQs used for enqueue → dispatch path. */
+    /* [C] Populate llc_cpu_mask from cpu_llc_id.
+     * Loop is bounded by both nr_cpus (RODATA const, JIT treats as bounded)
+     * and CAKE_MAX_CPUS (compile-time constant) — verifier sees a safe bound.
+     * Plain |= is safe: imperator_init runs exactly once before any task is
+     * scheduled, so no concurrent BPF program can read llc_cpu_mask yet. */
+    for (u32 cpu = 0; cpu < nr_cpus && cpu < CAKE_MAX_CPUS; cpu++) {
+        u32 llc = cpu_llc_id[cpu] & (CAKE_MAX_LLCS - 1);
+        llc_cpu_mask[llc] |= 1ULL << cpu;
+    }
+
     /* Create per-LLC DSQs — one per cache domain.
      * Single-CCD: 1 DSQ (single per-LLC DSQ).
      * Multi-CCD: N DSQs (eliminates cross-CCD lock contention).
@@ -1521,21 +1629,21 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cider_init)
 }
 
 /* Scheduler exit - record exit info */
-void BPF_STRUCT_OPS(cider_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(imperator_exit, struct scx_exit_info *ei)
 {
     UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(cider_ops,
-               .select_cpu     = (void *)cider_select_cpu,
-               .enqueue        = (void *)cider_enqueue,
-               .dispatch       = (void *)cider_dispatch,
-               .tick           = (void *)cider_tick,
-               .running        = (void *)cider_running,
-               .stopping       = (void *)cider_stopping,
-               .init_task      = (void *)cider_init_task,
-               .enable         = (void *)cider_enable,
-               .init           = (void *)cider_init,
-               .exit           = (void *)cider_exit,
+SCX_OPS_DEFINE(imperator_ops,
+               .select_cpu     = (void *)imperator_select_cpu,
+               .enqueue        = (void *)imperator_enqueue,
+               .dispatch       = (void *)imperator_dispatch,
+               .tick           = (void *)imperator_tick,
+               .running        = (void *)imperator_running,
+               .stopping       = (void *)imperator_stopping,
+               .init_task      = (void *)imperator_init_task,
+               .enable         = (void *)imperator_enable,
+               .init           = (void *)imperator_init,
+               .exit           = (void *)imperator_exit,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,
-               .name           = "cider");
+               .name           = "imperator");

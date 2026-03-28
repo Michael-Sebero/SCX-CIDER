@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * cider_bpf_s6.c — corrected s6-derived patch for scx_cider
+ * imperator_bpf_s6.c — corrected s6-derived patch for scx_imperator
  *
- * Apply each numbered section to cider_bpf.c at the location indicated by
+ * Apply each numbered section to imperator_bpf.c at the location indicated by
  * TARGET and ACTION markers.  The integration checklist at the end lists
  * every change and the order to apply them.
  *
  * FIXES vs PREVIOUS PATCH VERSION
  * ────────────────────────────────
- * [A] llc_cpu_mask: rodata → BSS.  Populated in [C] by cider_init from the
+ * [A] llc_cpu_mask: rodata → BSS.  Populated in [C] by imperator_init from the
  *     existing cpu_llc_id rodata.  Removes partial-deploy hazard where
  *     missing Rust write caused all-zero mask and silent kick failure.
  *
- * [C] cider_init: gains llc_cpu_mask computation.  Field is guaranteed
+ * [C] imperator_init: gains llc_cpu_mask computation.  Field is guaranteed
  *     non-zero before any task is scheduled.  Rust write no longer needed.
  *
- * [D] cider_running: simplified.  Removed old_tier read + conditional AND.
+ * [D] imperator_running: simplified.  Removed old_tier read + conditional AND.
  *     Stopping owns all clears; running only sets.  Saves ~8 cycles/switch.
  *
- * [G] cider_dispatch: dead `within_threshold_exhausted` variable deleted.
+ * [G] imperator_dispatch: dead `within_threshold_exhausted` variable deleted.
  *     Was 3 comparisons + 1 bool per cross-LLC dispatch with zero effect.
  *
  * [H] Overrun threshold: 5 → 4.  Restores original consecutive-path parity
@@ -38,15 +38,15 @@
  * TARGET: Replace `const u64 llc_cpu_mask[CAKE_MAX_LLCS] = {};` if present,
  *         or add after `const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};`.
  *
- * BSS is writable at BPF runtime.  cider_init fills this from cpu_llc_id
+ * BSS is writable at BPF runtime.  imperator_init fills this from cpu_llc_id
  * before any task is scheduled.  Declaring it as rodata (const) required the
  * Rust loader to write it; if that write was absent the field stayed zero and
  * the kick path produced zero kicks without any error or warning.
  *
- * With BSS + cider_init population: field is always correct, Rust write is
+ * With BSS + imperator_init population: field is always correct, Rust write is
  * no longer required, partial-deploy hazard is eliminated.
  *
- * LAYOUT: 8 × 8B = 64B, one cache line.  Read in cider_enqueue: one miss
+ * LAYOUT: 8 × 8B = 64B, one cache line.  Read in imperator_enqueue: one miss
  * loads the entire array.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -62,8 +62,8 @@ u64 llc_cpu_mask[CAKE_MAX_LLCS] SEC(".bss") __attribute__((aligned(64)));
  * a task of EWMA tier t.
  *
  * Responsibility split:
- *   cider_running  → set bit for new task's tier  (never clears)
- *   cider_stopping → clear bit for stopping tier  (never sets)
+ *   imperator_running  → set bit for new task's tier  (never clears)
+ *   imperator_stopping → clear bit for stopping tier  (never sets)
  *
  * LAYOUT: 4 × 8B = 32B.  All four tier words fit in one 64B cache line with
  * llc_cpu_mask, loaded together on the kick path.
@@ -73,10 +73,10 @@ u64 tier_cpu_mask[CAKE_TIER_MAX] SEC(".bss") __attribute__((aligned(64)));
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * [C] cider_init — compute llc_cpu_mask
+ * [C] imperator_init — compute llc_cpu_mask
  *
- * TARGET: Replace entire cider_init function.
- *         Search: `BPF_STRUCT_OPS_SLEEPABLE(cider_init)`
+ * TARGET: Replace entire imperator_init function.
+ *         Search: `BPF_STRUCT_OPS_SLEEPABLE(imperator_init)`
  *
  * cpu_llc_id[] is already RODATA set by the Rust loader.  nr_cpus is already
  * RODATA.  The loop is bounded by CAKE_MAX_CPUS (compile-time constant = 64);
@@ -89,7 +89,7 @@ u64 tier_cpu_mask[CAKE_TIER_MAX] SEC(".bss") __attribute__((aligned(64)));
  *                                   llc_cpu_mask[1] = 0xFFFF0000.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(cider_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(imperator_init)
 {
     /* Populate llc_cpu_mask from existing cpu_llc_id RODATA.
      * Runs exactly once at scheduler attachment, before any task is scheduled.
@@ -112,15 +112,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cider_init)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * [D] cider_running — simplified bitmask maintenance
+ * [D] imperator_running — simplified bitmask maintenance
  *
- * TARGET: Replace entire cider_running function.
- *         Search: `BPF_STRUCT_OPS(cider_running,`
+ * TARGET: Replace entire imperator_running function.
+ *         Search: `BPF_STRUCT_OPS(imperator_running,`
  *
  * SIMPLIFICATION vs PREVIOUS PATCH:
  *   Previous version read mbox->flags to get old_tier, then conditionally
- *   cleared tier_cpu_mask[old_tier].  This was redundant: cider_stopping
- *   already cleared the bit for the previous task before this cider_running
+ *   cleared tier_cpu_mask[old_tier].  This was redundant: imperator_stopping
+ *   already cleared the bit for the previous task before this imperator_running
  *   fires.  The double-clear was: AND(already-zero-bit) = no-op, every time.
  *
  *   Removed: one relaxed u8 load, one compare-branch, one conditional AND atomic.
@@ -132,17 +132,17 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cider_init)
  *   simultaneously — the atomic prevents torn read-modify-write at word level.
  *   No two CPUs ever write the same bit (each CPU owns bit = 1ULL << its id).
  *
- * COST vs ORIGINAL cider_running (no patch):
+ * COST vs ORIGINAL imperator_running (no patch):
  *   Added: one BPF_ATOMIC_OR (~5 cycles)
  *
- * COST vs PREVIOUS PATCH cider_running:
+ * COST vs PREVIOUS PATCH imperator_running:
  *   Removed: one relaxed load + one compare-branch + one conditional AND
  *   Net saved: ~8 cycles per context switch
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void BPF_STRUCT_OPS(cider_running, struct task_struct *p)
+void BPF_STRUCT_OPS(imperator_running, struct task_struct *p)
 {
-    struct cider_task_ctx *tctx = get_task_ctx(p, false);
+    struct imperator_task_ctx *tctx = get_task_ctx(p, false);
     if (!tctx)
         return;
     tctx->last_run_at = (u32)scx_bpf_now();
@@ -152,23 +152,23 @@ void BPF_STRUCT_OPS(cider_running, struct task_struct *p)
     u8 tier = CAKE_TIER_IDX(GET_TIER(tctx));
 
     /* Mailbox: publish tier immediately so waker-tier inheritance in
-     * cider_enqueue sees the correct value from the first nanosecond of
+     * imperator_enqueue sees the correct value from the first nanosecond of
      * this task's run, not after the first tick (~1–4ms later). */
-    u8 cur_flags = cider_relaxed_load_u8(&mbox->flags);
+    u8 cur_flags = imperator_relaxed_load_u8(&mbox->flags);
     if ((cur_flags & MBOX_TIER_MASK) != tier)
-        cider_relaxed_store_u8(&mbox->flags, (cur_flags & ~MBOX_TIER_MASK) | tier);
+        imperator_relaxed_store_u8(&mbox->flags, (cur_flags & ~MBOX_TIER_MASK) | tier);
 
     /* Bitmask: set this CPU's bit in the new task's tier word.
-     * cider_stopping owns all clears; we only set here — no double-ownership. */
+     * imperator_stopping owns all clears; we only set here — no double-ownership. */
     __sync_fetch_and_or(&tier_cpu_mask[tier & (CAKE_TIER_MAX - 1)], 1ULL << run_cpu);
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * [E] cider_stopping — bitmask clear before reclassification (unchanged)
+ * [E] imperator_stopping — bitmask clear before reclassification (unchanged)
  *
- * TARGET: Replace entire cider_stopping function.
- *         Search: `BPF_STRUCT_OPS(cider_stopping,`
+ * TARGET: Replace entire imperator_stopping function.
+ *         Search: `BPF_STRUCT_OPS(imperator_stopping,`
  *
  * ORDER IS CRITICAL: clear bit BEFORE reclassify_task_cold.
  *   reclassify_task_cold may change packed_info.tier.
@@ -176,13 +176,13 @@ void BPF_STRUCT_OPS(cider_running, struct task_struct *p)
  *   = the tier whose bit is set in tier_cpu_mask = correct bit to clear.
  *   After reclassification, GET_TIER would return the new (post-EWMA) tier.
  *
- * COST vs ORIGINAL cider_stopping (no patch):
+ * COST vs ORIGINAL imperator_stopping (no patch):
  *   Added: one BPF_ATOMIC_AND (~5 cycles)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
 {
-    struct cider_task_ctx *tctx = get_task_ctx(p, false);
+    struct imperator_task_ctx *tctx = get_task_ctx(p, false);
     if (tctx && likely(tctx->last_run_at)) {
         /* Clear this CPU's tier bit BEFORE reclassify changes packed_info. */
         u32 stop_cpu  = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
@@ -197,9 +197,9 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * [F] cider_enqueue — O(1) bitmask kick (unchanged, now guaranteed correct)
+ * [F] imperator_enqueue — O(1) bitmask kick (unchanged, now guaranteed correct)
  *
- * TARGET: Replace the kick scan block in cider_enqueue.
+ * TARGET: Replace the kick scan block in imperator_enqueue.
  *         Find `if (tier <= CAKE_TIER_INTERACT) {` and replace through
  *         the closing `}`.  Also delete the two now-unused local variables
  *         that precede it:
@@ -208,7 +208,7 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
  *         and the scan loop + scx_bpf_kick_cpu call.
  *
  * CORRECTNESS (fixed vs previous patch):
- *   llc_cpu_mask is now computed in cider_init — always non-zero for any
+ *   llc_cpu_mask is now computed in imperator_init — always non-zero for any
  *   LLC with at least one CPU.  The AND with tier_cpu_mask produces zero
  *   only when genuinely no T3/T2 CPU exists in the LLC, which is the correct
  *   "no victim" result.  The previous all-zero state from missing Rust write
@@ -224,17 +224,17 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
     if (tier <= CAKE_TIER_INTERACT) {
-        u64 my_llc_mask = cider_relaxed_load_u64(
+        u64 my_llc_mask = imperator_relaxed_load_u64(
             &llc_cpu_mask[enq_llc & (CAKE_MAX_LLCS - 1)]);
 
         /* Prefer displacing T3 (bulk) — lowest frame-time displacement cost */
-        u64 t3_in_llc = cider_relaxed_load_u64(
+        u64 t3_in_llc = imperator_relaxed_load_u64(
             &tier_cpu_mask[CAKE_TIER_BULK]) & my_llc_mask;
         if (t3_in_llc) {
             scx_bpf_kick_cpu(BIT_SCAN_FORWARD_U64(t3_in_llc), SCX_KICK_PREEMPT);
         } else {
             /* Fall back to displacing T2 (frame) when no T3 present in LLC */
-            u64 t2_in_llc = cider_relaxed_load_u64(
+            u64 t2_in_llc = imperator_relaxed_load_u64(
                 &tier_cpu_mask[CAKE_TIER_FRAME]) & my_llc_mask;
             if (t2_in_llc)
                 scx_bpf_kick_cpu(BIT_SCAN_FORWARD_U64(t2_in_llc), SCX_KICK_PREEMPT);
@@ -243,22 +243,22 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * [G] cider_dispatch — delete dead variable
+ * [G] imperator_dispatch — delete dead variable
  *
- * TARGET: Inside cider_dispatch, inside the BSF steal loop body, DELETE
+ * TARGET: Inside imperator_dispatch, inside the BSF steal loop body, DELETE
  *         these two lines (they appear after the stale-nonempty clear):
  *
  *   bool within_threshold_exhausted = (cheapest_llc < nr_llcs && ...);
  *   (void)within_threshold_exhausted;
  *
- * No other changes to cider_dispatch.  The loop after deletion:
+ * No other changes to imperator_dispatch.  The loop after deletion:
  *
  *   for (u32 i = 0; steal_mask && i < nr_llcs; i++) {
  *       u32 victim = BIT_SCAN_FORWARD_U32(steal_mask);
  *       steal_mask &= steal_mask - 1;
  *       if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + victim))
  *           return;
- *       cider_relaxed_store_u8(
+ *       imperator_relaxed_store_u8(
  *           &llc_nonempty[victim & (CAKE_MAX_LLCS - 1)].nonempty, 0);
  *   }
  *
@@ -324,7 +324,7 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
  * INTEGRATION CHECKLIST
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * cider_bpf.c — apply in this order:
+ * imperator_bpf.c — apply in this order:
  *
  *  [A] AFTER `const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};`:
  *      ADD the llc_cpu_mask BSS declaration above.
@@ -334,13 +334,13 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
  *  [B] AFTER llc_nonempty[] BSS declaration:
  *      ADD the tier_cpu_mask BSS declaration above.
  *
- *  [C] REPLACE entire cider_init function with the version above.
+ *  [C] REPLACE entire imperator_init function with the version above.
  *
- *  [D] REPLACE entire cider_running function with the version above.
+ *  [D] REPLACE entire imperator_running function with the version above.
  *
- *  [E] REPLACE entire cider_stopping function with the version above.
+ *  [E] REPLACE entire imperator_stopping function with the version above.
  *
- *  [F] In cider_enqueue, FIND the kick block starting with:
+ *  [F] In imperator_enqueue, FIND the kick block starting with:
  *        `u32 best_cpu    = CAKE_MAX_CPUS;`
  *        `u8  worst_tier  = CAKE_TIER_INTERACT;`
  *        `for (u32 i = 0; i < nr_cpus; i++) { ... }`
@@ -348,7 +348,7 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
  *      REPLACE the entire block (including the two variable declarations)
  *      with the `if (tier <= CAKE_TIER_INTERACT) { ... }` block above.
  *
- *  [G] In cider_dispatch BSF steal loop, DELETE:
+ *  [G] In imperator_dispatch BSF steal loop, DELETE:
  *        `bool within_threshold_exhausted = ...;`
  *        `(void)within_threshold_exhausted;`
  *
@@ -358,7 +358,7 @@ void BPF_STRUCT_OPS(cider_stopping, struct task_struct *p, bool runnable)
  *
  * main.rs:
  *  → Remove the commented-out llc_cpu_mask write block entirely.
- *    No Rust-side write is needed; cider_init computes it from cpu_llc_id.
+ *    No Rust-side write is needed; imperator_init computes it from cpu_llc_id.
  *  → All other changes (eventfd, try_lock, dynamic poll set) are unchanged.
  *
  * intf.h:
