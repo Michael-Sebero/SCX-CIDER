@@ -77,9 +77,9 @@ cider_select_cpu ───  IRQ detection ────────────�
                                                                      ▼
                                                               cider_enqueue
                                                                      │
-                                                                 IRQ tier override
-                                                                 Waker tier inheritance
-                                                                 Lock holder vtime advance
+                                                          Feature 1: IRQ tier override
+                                                          Feature 2: Waker tier inheritance
+                                                          Feature 3: Lock holder vtime advance
                                                                      │
                                                                      ▼
                                                          per-LLC DSQ (vtime = tier<<56 | ts)
